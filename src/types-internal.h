@@ -116,8 +116,8 @@ struct getdns_upstream;
 #define TIMEOUT_FOREVER ((int64_t)-1)
 #define ASSERT_UNREACHABLE 0
 
-#define GETDNS_TRANSPORTS_MAX 4
-#define GETDNS_UPSTREAM_TRANSPORTS 3
+#define GETDNS_TRANSPORTS_MAX 3
+#define GETDNS_UPSTREAM_TRANSPORTS 2
 
 /** @}
  */
@@ -203,11 +203,16 @@ typedef struct getdns_network_req
 	/* request type */
 	uint16_t request_type;
 
-	/* request class */
-	uint16_t request_class;
-
 	/* dnssec status */
 	int dnssec_status;
+
+	/* tsig status:
+	 * GETDNS_DNSSEC_INDETERMINATE means "No TSIG processing"
+	 * GETDNS_DNSSEC_INSECURE      means "TSIG sent, validate reply"
+	 * GETDNS_DNSSEC_SECURE        means "Validated"
+	 * GETDNS_DNSSEC_BOGUS         means "Validation failed"
+	 */
+	int tsig_status;
 
 	/* For stub resolving */
 	struct getdns_upstream *upstream;
@@ -223,8 +228,16 @@ typedef struct getdns_network_req
 	int                     edns_maximum_udp_payload_size;
 	uint16_t                max_udp_payload_size;
 
+	size_t                  keepalive_sent;
+
 	/* Network requests scheduled to write after me */
 	struct getdns_network_req *write_queue_tail;
+
+	/* Some fields to record info for return_call_reporting */
+	uint64_t                    debug_start_time;
+	uint64_t                    debug_end_time;
+	size_t                      debug_tls_auth_status;
+    size_t                      debug_udp;
 
 	/* When more space is needed for the wire_data response than is
 	 * available in wire_data[], it will be allocated seperately.
@@ -232,11 +245,26 @@ typedef struct getdns_network_req
 	 */
 	uint8_t *query;
 	uint8_t *opt; /* offset of OPT RR in query */
+
+	/* each network_req has a set of base options that are
+	 * specific to the query, which are static and included when
+	 * the network_req is created.  When the query is sent out to
+	 * a given upstream, some additional options are added that
+	 * are specific to the upstream.  There can be at most
+	 * GETDNS_MAXIMUM_UPSTREAM_OPTION_SPACE bytes of
+	 * upstream-specific options.
+
+	 * use _getdns_network_req_clear_upstream_options() and
+	 * _getdns_network_req_add_upstream_option() to fiddle with the
+	 */
+	size_t   base_query_option_sz;
 	size_t   response_len;
 	uint8_t *response;
 	size_t   wire_data_sz;
 	uint8_t  wire_data[];
 
+
+	
 } getdns_network_req;
 
 /**
@@ -251,6 +279,13 @@ typedef struct getdns_dns_req {
 	uint8_t name[256];
 	size_t  name_len;
 
+	getdns_append_name_t append_name;
+	const uint8_t *suffix;
+	size_t  suffix_len;
+	int suffix_appended;
+
+	uint16_t request_class;
+
 	/* canceled flag */
 	int canceled;
 
@@ -261,7 +296,15 @@ typedef struct getdns_dns_req {
 	int dnssec_return_status;
 	int dnssec_return_only_secure;
 	int dnssec_return_validation_chain;
+#ifdef DNSSEC_ROADBLOCK_AVOIDANCE
+	int dnssec_roadblock_avoidance;
+	int avoid_dnssec_roadblocks;
+#endif
 	int edns_cookies;
+	int edns_client_subnet_private;
+	uint16_t tls_query_padding_blocksize;
+	int return_call_reporting;
+	int add_warning_for_bad_dns;
 
 	/* Internally used by return_validation_chain */
 	int dnssec_ok_checking_disabled;
@@ -337,12 +380,26 @@ typedef struct getdns_dns_req {
 /* utility methods */
 
 extern getdns_dict *dnssec_ok_checking_disabled;
+extern getdns_dict *dnssec_ok_checking_disabled_roadblock_avoidance;
+extern getdns_dict *dnssec_ok_checking_disabled_avoid_roadblocks;
 
 /* dns request utils */
 getdns_dns_req *_getdns_dns_req_new(getdns_context *context, getdns_eventloop *loop,
     const char *name, uint16_t request_type, getdns_dict *extensions);
 
 void _getdns_dns_req_free(getdns_dns_req * req);
+
+/* network request utils */
+getdns_return_t _getdns_network_req_add_upstream_option(getdns_network_req * req,
+					     uint16_t code, uint16_t sz, const void* data);
+void _getdns_network_req_clear_upstream_options(getdns_network_req * req);
+
+/* Adds TSIG signature (if needed) and returns query length */
+size_t _getdns_network_req_add_tsig(getdns_network_req *req);
+
+void _getdns_network_validate_tsig(getdns_network_req *req);
+
+void _getdns_netreq_reinit(getdns_network_req *netreq);
 
 #endif
 /* types-internal.h */

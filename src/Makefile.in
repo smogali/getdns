@@ -64,8 +64,8 @@ EXTENSION_LIBUV_LDFLAGS=@EXTENSION_LIBUV_LDFLAGS@
 C99COMPATFLAGS=@C99COMPATFLAGS@
 
 GETDNS_OBJ=const-info.lo convert.lo dict.lo dnssec.lo general.lo \
-	list.lo request-internal.lo rr-dict.lo rr-iter.lo stub.lo sync.lo \
-	util-internal.lo
+	list.lo request-internal.lo pubkey-pinning.lo rr-dict.lo \
+	rr-iter.lo stub.lo sync.lo util-internal.lo
 
 GLDNS_OBJ=keyraw.lo gbuffer.lo wire2str.lo parse.lo parseutil.lo rrdef.lo \
 	str2wire.lo
@@ -74,7 +74,7 @@ LIBOBJDIR=
 LIBOBJS=@LIBOBJS@
 COMPAT_OBJ=$(LIBOBJS:.o=.lo)
 
-UTIL_OBJ=mini_event.lo rbtree.lo val_secalgo.lo
+UTIL_OBJ=mini_event.lo winsock_event.lo rbtree.lo val_secalgo.lo
 
 EXTENSION_OBJ=libmini_event.lo libevent.lo libev.lo
 
@@ -117,7 +117,7 @@ install:	libgetdns.la
 	$(INSTALL) -m 755 -d $(DESTDIR)$(includedir)
 	$(INSTALL) -m 755 -d $(DESTDIR)$(includedir)/getdns
 	$(INSTALL) -m 644 getdns/getdns.h $(DESTDIR)$(includedir)/getdns/getdns.h
-	$(INSTALL) -m 644 $(srcdir)/getdns/getdns_extra.h $(DESTDIR)$(includedir)/getdns/getdns_extra.h
+	$(INSTALL) -m 644 getdns/getdns_extra.h $(DESTDIR)$(includedir)/getdns/getdns_extra.h
 	$(INSTALL) -m 755 -d $(DESTDIR)$(libdir)
 	$(LIBTOOL) --mode=install cp libgetdns.la $(DESTDIR)$(libdir)
 	if test $(have_libevent) = 1 ; then $(INSTALL) -m 644 $(srcdir)/getdns/getdns_ext_libevent.h $(DESTDIR)$(includedir)/getdns/ ; $(LIBTOOL) --mode=install cp $(EXTENSION_LIBEVENT_LIB) $(DESTDIR)$(libdir) ; fi
@@ -167,7 +167,7 @@ clean:
 distclean : clean
 	cd test && $(MAKE) $@
 	rmdir test 2>/dev/null || true
-	rm -f Makefile config.status config.log Doxyfile config.h getdns/Makefile getdns/getdns.h
+	rm -f Makefile config.status config.log Doxyfile config.h version.c getdns/Makefile getdns/getdns.h getdns/getdns_extra.h
 	rmdir getdns 2>/dev/null || true
 	rmdir extension 2>/dev/null || true
 	rm -Rf autom4te.cache
@@ -203,8 +203,9 @@ configure.status: configure
 
 depend:
 	(cd $(srcdir) ; awk 'BEGIN{P=1}{if(P)print}/^# Dependencies/{P=0}' Makefile.in > Makefile.in.new )
-	(cd $(srcdir) ; gcc -MM -I. *.c gldns/*.c compat/*.c util/*.c extension/*.c| \
-		sed -e 's?gldns/?$$(srcdir)/gldns/?g' \
+	(blddir=`pwd`; cd $(srcdir) ; gcc -MM -I. -I"$$blddir" *.c gldns/*.c compat/*.c util/*.c extension/*.c| \
+		sed -e "s? $$blddir/? ?g" \
+		    -e 's?gldns/?$$(srcdir)/gldns/?g' \
 		    -e 's?compat/?$$(srcdir)/compat/?g' \
 		    -e 's?util/?$$(srcdir)/util/?g' \
 		    -e 's?extension/?$$(srcdir)/extension/?g' \
@@ -226,23 +227,23 @@ FORCE:
 # Dependencies for gldns, utils, the extensions and compat functions
 const-info.lo const-info.o: $(srcdir)/const-info.c getdns/getdns.h getdns/getdns_extra.h \
  getdns/getdns.h $(srcdir)/const-info.h
-context.lo context.o: $(srcdir)/context.c config.h $(srcdir)/gldns/str2wire.h $(srcdir)/gldns/rrdef.h \
+context.lo context.o: $(srcdir)/context.c config.h $(srcdir)/debug.h $(srcdir)/gldns/str2wire.h $(srcdir)/gldns/rrdef.h \
  $(srcdir)/gldns/wire2str.h $(srcdir)/context.h getdns/getdns.h getdns/getdns_extra.h \
  getdns/getdns.h $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h $(srcdir)/extension/libmini_event.h \
  config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h \
  $(srcdir)/util-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h \
- $(srcdir)/dnssec.h $(srcdir)/stub.h $(srcdir)/list.h
+ $(srcdir)/dnssec.h $(srcdir)/stub.h $(srcdir)/list.h $(srcdir)/dict.h $(srcdir)/pubkey-pinning.h
 convert.lo convert.o: $(srcdir)/convert.c config.h getdns/getdns.h getdns/getdns_extra.h \
  getdns/getdns.h $(srcdir)/util-internal.h $(srcdir)/context.h $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h \
  $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h \
  $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h \
- $(srcdir)/gldns/wire2str.h $(srcdir)/gldns/str2wire.h $(srcdir)/gldns/rrdef.h
-dict.lo dict.o: $(srcdir)/dict.c $(srcdir)/types-internal.h getdns/getdns.h getdns/getdns_extra.h \
- getdns/getdns.h $(srcdir)/util/rbtree.h $(srcdir)/util-internal.h config.h $(srcdir)/context.h \
- $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h \
- $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h \
- $(srcdir)/dict.h $(srcdir)/list.h $(srcdir)/const-info.h $(srcdir)/gldns/wire2str.h
-dnssec.lo dnssec.o: $(srcdir)/dnssec.c getdns/getdns.h config.h $(srcdir)/context.h \
+ $(srcdir)/gldns/wire2str.h $(srcdir)/gldns/str2wire.h $(srcdir)/gldns/rrdef.h $(srcdir)/dict.h $(srcdir)/list.h $(srcdir)/convert.h
+dict.lo dict.o: $(srcdir)/dict.c config.h $(srcdir)/types-internal.h getdns/getdns.h \
+ getdns/getdns_extra.h getdns/getdns.h $(srcdir)/util/rbtree.h $(srcdir)/util-internal.h \
+ $(srcdir)/context.h $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h \
+ $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h \
+ $(srcdir)/gldns/pkthdr.h $(srcdir)/dict.h $(srcdir)/list.h $(srcdir)/const-info.h $(srcdir)/gldns/wire2str.h
+dnssec.lo dnssec.o: $(srcdir)/dnssec.c config.h $(srcdir)/debug.h getdns/getdns.h $(srcdir)/context.h \
  getdns/getdns_extra.h getdns/getdns.h $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h \
  $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h \
  $(srcdir)/types-internal.h $(srcdir)/util-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h \
@@ -253,18 +254,22 @@ general.lo general.o: $(srcdir)/general.c config.h $(srcdir)/gldns/wire2str.h $(
  getdns/getdns_extra.h getdns/getdns.h $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h \
  $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h \
  $(srcdir)/types-internal.h $(srcdir)/util-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h \
- $(srcdir)/gldns/pkthdr.h $(srcdir)/dnssec.h $(srcdir)/stub.h
+ $(srcdir)/gldns/pkthdr.h $(srcdir)/dnssec.h $(srcdir)/stub.h $(srcdir)/general.h
 list.lo list.o: $(srcdir)/list.c $(srcdir)/types-internal.h getdns/getdns.h getdns/getdns_extra.h \
  getdns/getdns.h $(srcdir)/util/rbtree.h $(srcdir)/util-internal.h config.h $(srcdir)/context.h \
  $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h \
  $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h \
  $(srcdir)/list.h $(srcdir)/dict.h
+pubkey-pinning.lo pubkey-pinning.o: $(srcdir)/pubkey-pinning.c config.h $(srcdir)/debug.h getdns/getdns.h \
+ $(srcdir)/context.h getdns/getdns.h getdns/getdns_extra.h $(srcdir)/types-internal.h \
+ $(srcdir)/util/rbtree.h $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h \
+ $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h
 request-internal.lo request-internal.o: $(srcdir)/request-internal.c config.h $(srcdir)/types-internal.h \
  getdns/getdns.h getdns/getdns_extra.h getdns/getdns.h $(srcdir)/util/rbtree.h \
  $(srcdir)/util-internal.h $(srcdir)/context.h $(srcdir)/extension/libmini_event.h config.h \
  $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h \
  $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h $(srcdir)/gldns/rrdef.h $(srcdir)/gldns/str2wire.h \
- $(srcdir)/gldns/rrdef.h $(srcdir)/dict.h
+ $(srcdir)/gldns/rrdef.h $(srcdir)/dict.h $(srcdir)/debug.h
 rr-dict.lo rr-dict.o: $(srcdir)/rr-dict.c $(srcdir)/rr-dict.h config.h getdns/getdns.h $(srcdir)/gldns/gbuffer.h \
  $(srcdir)/util-internal.h $(srcdir)/context.h getdns/getdns_extra.h getdns/getdns.h \
  $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h $(srcdir)/extension/libmini_event.h config.h \
@@ -272,19 +277,20 @@ rr-dict.lo rr-dict.o: $(srcdir)/rr-dict.c $(srcdir)/rr-dict.h config.h getdns/ge
  $(srcdir)/gldns/pkthdr.h $(srcdir)/dict.h
 rr-iter.lo rr-iter.o: $(srcdir)/rr-iter.c $(srcdir)/rr-iter.h getdns/getdns.h $(srcdir)/rr-dict.h config.h \
  $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h $(srcdir)/gldns/rrdef.h
-stub.lo stub.o: $(srcdir)/stub.c config.h $(srcdir)/stub.h getdns/getdns.h $(srcdir)/types-internal.h \
+stub.lo stub.o: $(srcdir)/stub.c config.h $(srcdir)/debug.h $(srcdir)/stub.h getdns/getdns.h $(srcdir)/types-internal.h \
  getdns/getdns_extra.h getdns/getdns.h $(srcdir)/util/rbtree.h $(srcdir)/gldns/gbuffer.h \
- $(srcdir)/gldns/pkthdr.h $(srcdir)/gldns/rrdef.h $(srcdir)/gldns/str2wire.h $(srcdir)/gldns/rrdef.h $(srcdir)/rr-iter.h \
- $(srcdir)/rr-dict.h $(srcdir)/context.h $(srcdir)/extension/libmini_event.h config.h $(srcdir)/util/mini_event.h \
- $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h $(srcdir)/util-internal.h $(srcdir)/general.h
+ $(srcdir)/gldns/pkthdr.h $(srcdir)/gldns/rrdef.h $(srcdir)/gldns/str2wire.h $(srcdir)/gldns/rrdef.h \
+ $(srcdir)/gldns/wire2str.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/context.h $(srcdir)/extension/libmini_event.h \
+ config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h \
+ $(srcdir)/util-internal.h $(srcdir)/general.h $(srcdir)/pubkey-pinning.h
 sync.lo sync.o: $(srcdir)/sync.c getdns/getdns.h config.h $(srcdir)/context.h getdns/getdns_extra.h \
  getdns/getdns.h $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h $(srcdir)/extension/libmini_event.h \
  config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h $(srcdir)/general.h \
  $(srcdir)/util-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h \
  $(srcdir)/dnssec.h $(srcdir)/stub.h $(srcdir)/gldns/wire2str.h
-util-internal.lo util-internal.o: $(srcdir)/util-internal.c getdns/getdns.h $(srcdir)/dict.h $(srcdir)/util/rbtree.h \
- $(srcdir)/types-internal.h getdns/getdns_extra.h getdns/getdns.h $(srcdir)/list.h \
- $(srcdir)/util-internal.h config.h $(srcdir)/context.h $(srcdir)/extension/libmini_event.h config.h \
+util-internal.lo util-internal.o: $(srcdir)/util-internal.c config.h getdns/getdns.h $(srcdir)/dict.h \
+ $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h getdns/getdns_extra.h getdns/getdns.h \
+ $(srcdir)/list.h $(srcdir)/util-internal.h $(srcdir)/context.h $(srcdir)/extension/libmini_event.h config.h \
  $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h \
  $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h $(srcdir)/gldns/str2wire.h $(srcdir)/gldns/rrdef.h
 version.lo version.o: version.c
@@ -307,35 +313,26 @@ getentropy_linux.lo getentropy_linux.o: $(srcdir)/compat/getentropy_linux.c conf
 getentropy_osx.lo getentropy_osx.o: $(srcdir)/compat/getentropy_osx.c config.h
 getentropy_solaris.lo getentropy_solaris.o: $(srcdir)/compat/getentropy_solaris.c config.h
 getentropy_win.lo getentropy_win.o: $(srcdir)/compat/getentropy_win.c
+inet_ntop.lo inet_ntop.o: $(srcdir)/compat/inet_ntop.c config.h
+inet_pton.lo inet_pton.o: $(srcdir)/compat/inet_pton.c config.h
 sha512.lo sha512.o: $(srcdir)/compat/sha512.c config.h
 strlcpy.lo strlcpy.o: $(srcdir)/compat/strlcpy.c config.h
 mini_event.lo mini_event.o: $(srcdir)/util/mini_event.c config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h \
  $(srcdir)/util/fptr_wlist.h
-rbtree.lo rbtree.o: $(srcdir)/util/rbtree.c config.h $(srcdir)/util/log.h $(srcdir)/util-internal.h config.h \
- $(srcdir)/context.h getdns/getdns.h getdns/getdns_extra.h getdns/getdns.h \
- $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h $(srcdir)/extension/libmini_event.h \
- $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h \
- $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h $(srcdir)/util/fptr_wlist.h
+rbtree.lo rbtree.o: $(srcdir)/util/rbtree.c config.h $(srcdir)/util/log.h $(srcdir)/debug.h config.h \
+ $(srcdir)/util/fptr_wlist.h $(srcdir)/util/rbtree.h
 val_secalgo.lo val_secalgo.o: $(srcdir)/util/val_secalgo.c config.h $(srcdir)/util/val_secalgo.h $(srcdir)/util/log.h \
- $(srcdir)/util-internal.h config.h $(srcdir)/context.h getdns/getdns.h getdns/getdns_extra.h \
- getdns/getdns.h $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h $(srcdir)/extension/libmini_event.h \
- $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h \
- $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h $(srcdir)/gldns/rrdef.h $(srcdir)/gldns/keyraw.h \
- $(srcdir)/gldns/gbuffer.h
-libev.lo libev.o: $(srcdir)/extension/libev.c $(srcdir)/getdns/getdns_ext_libev.h getdns/getdns.h \
- getdns/getdns_extra.h $(srcdir)/types-internal.h getdns/getdns.h \
- getdns/getdns_extra.h $(srcdir)/util/rbtree.h config.h
-libevent.lo libevent.o: $(srcdir)/extension/libevent.c $(srcdir)/getdns/getdns_ext_libevent.h \
- getdns/getdns.h getdns/getdns_extra.h $(srcdir)/types-internal.h getdns/getdns.h \
- getdns/getdns_extra.h $(srcdir)/util/rbtree.h config.h
-libmini_event.lo libmini_event.o: $(srcdir)/extension/libmini_event.c $(srcdir)/extension/libmini_event.h \
- config.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h $(srcdir)/types-internal.h \
+ $(srcdir)/debug.h config.h $(srcdir)/gldns/rrdef.h $(srcdir)/gldns/keyraw.h $(srcdir)/gldns/gbuffer.h
+winsock_event.lo winsock_event.o: $(srcdir)/util/winsock_event.c config.h
+libev.lo libev.o: $(srcdir)/extension/libev.c config.h $(srcdir)/types-internal.h getdns/getdns.h \
+ getdns/getdns_extra.h getdns/getdns.h $(srcdir)/util/rbtree.h \
+ $(srcdir)/getdns/getdns_ext_libev.h getdns/getdns_extra.h
+libevent.lo libevent.o: $(srcdir)/extension/libevent.c config.h $(srcdir)/types-internal.h \
  getdns/getdns.h getdns/getdns_extra.h getdns/getdns.h $(srcdir)/util/rbtree.h \
- $(srcdir)/context.h config.h $(srcdir)/types-internal.h $(srcdir)/extension/libmini_event.h \
- $(srcdir)/util-internal.h $(srcdir)/context.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h \
- $(srcdir)/gldns/pkthdr.h
-libuv.lo libuv.o: $(srcdir)/extension/libuv.c config.h $(srcdir)/getdns/getdns_ext_libuv.h \
- getdns/getdns.h getdns/getdns_extra.h $(srcdir)/util-internal.h config.h $(srcdir)/context.h \
- getdns/getdns.h getdns/getdns_extra.h $(srcdir)/types-internal.h $(srcdir)/util/rbtree.h \
- $(srcdir)/extension/libmini_event.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h \
- $(srcdir)/types-internal.h $(srcdir)/rr-iter.h $(srcdir)/rr-dict.h $(srcdir)/gldns/gbuffer.h $(srcdir)/gldns/pkthdr.h
+ $(srcdir)/getdns/getdns_ext_libevent.h getdns/getdns_extra.h
+libmini_event.lo libmini_event.o: $(srcdir)/extension/libmini_event.c config.h $(srcdir)/debug.h config.h \
+ $(srcdir)/types-internal.h getdns/getdns.h getdns/getdns_extra.h getdns/getdns.h \
+ $(srcdir)/util/rbtree.h $(srcdir)/extension/libmini_event.h $(srcdir)/util/mini_event.h $(srcdir)/util/rbtree.h
+libuv.lo libuv.o: $(srcdir)/extension/libuv.c config.h $(srcdir)/debug.h config.h $(srcdir)/types-internal.h \
+ getdns/getdns.h getdns/getdns_extra.h getdns/getdns.h $(srcdir)/util/rbtree.h \
+ $(srcdir)/getdns/getdns_ext_libuv.h getdns/getdns_extra.h

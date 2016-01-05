@@ -35,10 +35,13 @@
  */
 
 #include <ctype.h>
+#include "config.h"
+#ifndef USE_WINSOCK
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#endif
 
 #include "types-internal.h"
 #include "util-internal.h"
@@ -277,7 +280,8 @@ getdns_dict_get_names(const getdns_dict *dict, getdns_list **answer)
 
 	RBTREE_FOR(item, struct getdns_dict_item *,
 		(_getdns_rbtree_t *)&(dict->root)) {
-		_getdns_list_append_string(*answer, item->node.key);
+		_getdns_list_append_const_bindata(*answer,
+		    strlen(item->node.key) + 1, item->node.key);
 	}
 	return GETDNS_RETURN_GOOD;
 }				/* getdns_dict_get_names */
@@ -574,17 +578,17 @@ getdns_dict_set_list(
 
 /*---------------------------------------- getdns_dict_set_bindata */
 getdns_return_t
-getdns_dict_set_bindata(
-    getdns_dict *dict, const char *name, const getdns_bindata *child_bindata)
+_getdns_dict_set_const_bindata(
+    getdns_dict *dict, const char *name, size_t size, const void *data)
 {
 	getdns_item    *item;
 	getdns_bindata *newbindata;
 	getdns_return_t r;
 
-	if (!dict || !name || !child_bindata)
+	if (!dict || !name)
 		return GETDNS_RETURN_INVALID_PARAMETER;
 
-	if (!(newbindata = _getdns_bindata_copy(&dict->mf, child_bindata)))
+	if (!(newbindata = _getdns_bindata_copy(&dict->mf, size, data)))
 		return GETDNS_RETURN_MEMORY_ERROR;
 
 	if ((r = _getdns_dict_find_and_add(dict, name, &item))) {
@@ -596,32 +600,22 @@ getdns_dict_set_bindata(
 	return GETDNS_RETURN_GOOD;
 }				/* getdns_dict_set_bindata */
 
+getdns_return_t
+getdns_dict_set_bindata(
+    getdns_dict *dict, const char *name, const getdns_bindata *child_bindata)
+{
+	return !child_bindata ? GETDNS_RETURN_INVALID_PARAMETER
+	    : _getdns_dict_set_const_bindata(
+	    dict, name, child_bindata->size, child_bindata->data);
+}
+
 /*---------------------------------------- getdns_dict_set_bindata */
 getdns_return_t
 getdns_dict_util_set_string(getdns_dict *dict, char *name, const char *value)
 {
-	getdns_item    *item;
-	getdns_bindata *newbindata;
-	getdns_return_t r;
-
-	if (!dict || !name || !value)
-		return GETDNS_RETURN_INVALID_PARAMETER;
-
-	if (!(newbindata = GETDNS_MALLOC(dict->mf, getdns_bindata)))
-		return GETDNS_RETURN_MEMORY_ERROR;
-
-	newbindata->size = strlen(value);
-	if (!(newbindata->data = (void *)_getdns_strdup(&dict->mf, value))) {
-		GETDNS_FREE(dict->mf, newbindata);
-		return GETDNS_RETURN_MEMORY_ERROR;
-	}
-	if ((r = _getdns_dict_find_and_add(dict, name, &item))) {
-		_getdns_bindata_destroy(&dict->mf, newbindata);
-		return r;
-	}
-	item->dtype = t_bindata;
-	item->data.bindata = newbindata;
-	return GETDNS_RETURN_GOOD;
+	return value
+	    ? _getdns_dict_set_const_bindata(dict, name, strlen(value), value)
+	    : GETDNS_RETURN_INVALID_PARAMETER;
 }				/* getdns_dict_util_set_dict */
 
 /*---------------------------------------- getdns_dict_set_int */
@@ -656,12 +650,15 @@ getdns_indent(size_t indent)
 	return spaces + 80 - (indent < 80 ? indent : 0);
 }				/* getdns_indent */
 
-static int
+int
 _getdns_bindata_is_dname(getdns_bindata *bindata)
 {
 	size_t i = 0, n_labels = 0;
 
 	while (i < bindata->size && bindata->data[i]) {
+		if (bindata->data[i] & 0xC0) /* Compression pointer! */
+			return 0;
+
 		i += ((size_t)bindata->data[i]) + 1;
 		n_labels++;
 	}
@@ -981,6 +978,7 @@ getdns_pp_dict(gldns_buffer * buf, size_t indent,
 			if (!json &&
 			    (strcmp(item->node.key, "type") == 0  ||
 			     strcmp(item->node.key, "type_covered") == 0 ||
+				 strcmp(item->node.key, "query_type") == 0 || 
 			     strcmp(item->node.key, "qtype") == 0) &&
 			    (strval = _getdns_rr_type_name(item->i.data.n))) {
 				if (gldns_buffer_printf(
@@ -991,10 +989,13 @@ getdns_pp_dict(gldns_buffer * buf, size_t indent,
 			if (!json &&
 			    (strcmp(item->node.key, "answer_type") == 0  ||
 			     strcmp(item->node.key, "dnssec_status") == 0 ||
+			     strcmp(item->node.key, "tsig_status") == 0 ||
 			     strcmp(item->node.key, "status") == 0 ||
 			     strcmp(item->node.key, "append_name") == 0 ||
 			     strcmp(item->node.key, "follow_redirects") == 0 ||
-			     strcmp(item->node.key, "resolution_type") == 0) &&
+				 strcmp(item->node.key, "transport") == 0 ||
+			     strcmp(item->node.key, "resolution_type") == 0 ||
+			     strcmp(item->node.key, "tls_authentication") == 0 ) &&
 			    (strval =
 			     _getdns_get_const_info(item->i.data.n)->name)) {
 				if (gldns_buffer_printf(buf, " %s", strval) < 0)
@@ -1057,7 +1058,8 @@ getdns_pp_dict(gldns_buffer * buf, size_t indent,
 				return -1;
 			if (getdns_pp_list(buf, indent, item->i.data.list, 
 			    (strcmp(item->node.key, "namespaces") == 0 ||
-			     strcmp(item->node.key, "dns_transport_list") == 0),
+			     strcmp(item->node.key, "dns_transport_list") == 0
+			     || strcmp(item->node.key, "bad_dns") == 0),
 			    json) < 0)
 				return -1;
 			break;

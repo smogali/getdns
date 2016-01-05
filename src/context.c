@@ -34,17 +34,28 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "config.h"
+
+#ifndef USE_WINSOCK
 #include <arpa/inet.h>
+#include <sys/time.h>
+#include <netdb.h>
+#else
+#include <winsock2.h>
+#include <iphlpapi.h>
+typedef unsigned short in_port_t;
+#endif
+
+#include <sys/stat.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/stat.h>
-#include <sys/time.h>
+
 #include <assert.h>
-#include <netdb.h>
 #include <ctype.h>
 
 #include "config.h"
+#include "debug.h"
 #include "gldns/str2wire.h"
 #include "gldns/wire2str.h"
 #include "context.h"
@@ -53,6 +64,8 @@
 #include "dnssec.h"
 #include "stub.h"
 #include "list.h"
+#include "dict.h"
+#include "pubkey-pinning.h"
 
 #define GETDNS_PORT_ZERO 0
 #define GETDNS_PORT_DNS 53
@@ -70,9 +83,11 @@ typedef struct host_name_addrs {
 	uint8_t host_name[];
 } host_name_addrs;
 
+
+/*  If changing these lists also remember to 
+    change the value of GETDNS_UPSTREAM_TRANSPORTS */
 static getdns_transport_list_t 
 getdns_upstream_transports[GETDNS_UPSTREAM_TRANSPORTS] = {
-	GETDNS_TRANSPORT_STARTTLS, // Define before TCP to ease fallback
 	GETDNS_TRANSPORT_TCP,
 	GETDNS_TRANSPORT_TLS,
 };
@@ -80,22 +95,20 @@ getdns_upstream_transports[GETDNS_UPSTREAM_TRANSPORTS] = {
 static in_port_t 
 getdns_port_array[GETDNS_UPSTREAM_TRANSPORTS] = {
 	GETDNS_PORT_DNS,
-	GETDNS_PORT_DNS,
 	GETDNS_PORT_DNS_OVER_TLS
 };
 
-char*
+static char*
 getdns_port_str_array[] = {
-	GETDNS_STR_PORT_DNS,
 	GETDNS_STR_PORT_DNS,
 	GETDNS_STR_PORT_DNS_OVER_TLS
 };
 
+static const uint8_t no_suffixes[] = { 1, 0 };
+
 /* Private functions */
 static getdns_return_t create_default_namespaces(struct getdns_context *context);
 static getdns_return_t create_default_dns_transports(struct getdns_context *context);
-static struct getdns_list *create_default_root_servers(void);
-static getdns_return_t set_os_defaults(struct getdns_context *);
 static int transaction_id_cmp(const void *, const void *);
 static void dispatch_updated(struct getdns_context *, uint16_t);
 static void cancel_dns_req(getdns_dns_req *);
@@ -166,7 +179,7 @@ static inline void canonicalize_dname(uint8_t *dname)
 {
 	uint8_t *next_label;
 
-	while (*dname) {
+	while (*dname && !(*dname & 0xC0)) {
 		next_label = dname + *dname + 1;
 		dname += 1;
 		while (dname < next_label) {
@@ -356,7 +369,11 @@ create_local_hosts(getdns_context *context)
 	int start_of_line = 1;
 	getdns_dict *address = NULL;
 
+#ifdef USE_WINSOCK
+	in = fopen("c:\\WINDOWS\\system32\\drivers\\etc\\hosts", "r");
+#else
 	in = fopen("/etc/hosts", "r");
+#endif
 	while (fgets(pos, (int)(sizeof(buf) - (pos - buf)), in)) {
 		pos = buf;
 		/* Break out of for to read more */
@@ -438,16 +455,6 @@ read_more:	;
 }
 
 /**
- * Helper to get the default root servers.
- * TODO: Implement
- */
-static struct getdns_list *
-create_default_root_servers()
-{
-    return NULL;
-}
-
-/**
  * check a file for changes since the last check
  * and refresh the current data if changes are detected
  * @param context pointer to a previously created context to be used for this call
@@ -512,16 +519,6 @@ upstreams_create(getdns_context *context, size_t size)
 	return r;
 }
 
-static getdns_upstreams *
-upstreams_resize(getdns_upstreams *upstreams, size_t size)
-{
-	getdns_upstreams *r = (void *) GETDNS_XREALLOC(
-	    upstreams->mf, upstreams, char,
-	    sizeof(getdns_upstreams) +
-	    sizeof(getdns_upstream) * size);
-	return r;
-}
-
 void
 _getdns_upstreams_dereference(getdns_upstreams *upstreams)
 {
@@ -534,6 +531,7 @@ _getdns_upstreams_dereference(getdns_upstreams *upstreams)
 	    ; upstreams->count
 	    ; upstreams->count--, upstream++ ) {
 
+		sha256_pin_t *pin = upstream->tls_pubkey_pinset;
 		if (upstream->loop && (   upstream->event.read_cb
 		                       || upstream->event.write_cb
 		                       || upstream->event.timeout_cb) ) {
@@ -549,6 +547,12 @@ _getdns_upstreams_dereference(getdns_upstreams *upstreams)
 		}
 		if (upstream->fd != -1)
 			close(upstream->fd);
+		while (pin) {
+			sha256_pin_t *nextpin = pin->next;
+			GETDNS_FREE(upstreams->mf, pin);
+			pin = nextpin;
+		}
+		upstream->tls_pubkey_pinset = NULL;
 	}
 	GETDNS_FREE(upstreams->mf, upstreams);
 }
@@ -567,6 +571,7 @@ _getdns_upstream_shutdown(getdns_upstream *upstream)
 		upstream->tcp.write_error = 0;
 	upstream->writes_done = 0;
 	upstream->responses_received = 0;
+	upstream->keepalive_timeout = 0;
 	if (upstream->tls_hs_state != GETDNS_HS_FAILED) {
 		upstream->tls_hs_state = GETDNS_HS_NONE;
 		upstream->tls_auth_failed = 0;
@@ -584,8 +589,7 @@ _getdns_upstream_shutdown(getdns_upstream *upstream)
 static int
 tls_is_in_transports_list(getdns_context *context) {
 	for (int i=0; i< context->dns_transport_count;i++) {
-		if (context->dns_transports[i] == GETDNS_TRANSPORT_TLS ||
-		    context->dns_transports[i] == GETDNS_TRANSPORT_STARTTLS)
+		if (context->dns_transports[i] == GETDNS_TRANSPORT_TLS)
 			return 1;
 	}
 	return 0;
@@ -595,8 +599,7 @@ static int
 tls_only_is_in_transports_list(getdns_context *context) {
 	if (context->dns_transport_count != 1)
 		return 0;
-	if (context->dns_transports[0] == GETDNS_TRANSPORT_TLS ||
-		context->dns_transports[0] == GETDNS_TRANSPORT_STARTTLS)
+	if (context->dns_transports[0] == GETDNS_TRANSPORT_TLS)
 			return 1;
 	return 0;
 }
@@ -606,6 +609,73 @@ static int
 net_req_query_id_cmp(const void *id1, const void *id2)
 {
 	return (intptr_t)id1 - (intptr_t)id2;
+}
+
+static getdns_tsig_info const tsig_info[] = {
+	  { GETDNS_NO_TSIG, NULL, 0, NULL, 0, 0, 0 }
+	, { GETDNS_HMAC_MD5   , "hmac-md5.sig-alg.reg.int", 24
+	       , (uint8_t *)"\x08hmac-md5\x07sig-alg\x03reg\x03int", 26, 10, 16 }
+	, { GETDNS_NO_TSIG, NULL, 0, NULL, 0, 0, 0 }
+	, { GETDNS_HMAC_SHA1  , "hmac-sha1"  ,  9
+	       , (uint8_t *)"\x09hmac-sha1"  , 11, 10, 20 }
+	, { GETDNS_HMAC_SHA224, "hmac-sha224", 11
+	       , (uint8_t *)"\x0bhmac-sha224", 13, 14, 28 }
+	, { GETDNS_HMAC_SHA256, "hmac-sha256", 11
+	       , (uint8_t *)"\x0bhmac-sha256", 13, 16, 32 }
+	, { GETDNS_HMAC_SHA384, "hmac-sha384", 11
+	       , (uint8_t *)"\x0bhmac-sha384", 13, 24, 48 }
+	, { GETDNS_HMAC_SHA512, "hmac-sha512", 11
+	       , (uint8_t *)"\x0bhmac-sha512", 13, 32, 64 }
+	, { GETDNS_HMAC_MD5   , "hmac-md5"   ,  8
+	       , (uint8_t *)"\x08hmac-md5"   , 10, 10, 16 }
+};
+static size_t const n_tsig_infos =
+    sizeof(tsig_info) / sizeof(getdns_tsig_info);
+
+static getdns_tsig_info const * const last_tsig_info =
+    tsig_info + (sizeof(tsig_info) / sizeof(getdns_tsig_info));
+
+const getdns_tsig_info *_getdns_get_tsig_info(getdns_tsig_algo tsig_alg)
+{
+	return tsig_alg > n_tsig_infos - 1
+	    || tsig_info[tsig_alg].alg == GETDNS_NO_TSIG ? NULL
+	    : &tsig_info[tsig_alg];
+}
+
+static getdns_tsig_algo _getdns_get_tsig_algo(getdns_bindata *algo)
+{
+	const getdns_tsig_info *i;
+
+	if (!algo || algo->size == 0)
+		return GETDNS_NO_TSIG;
+
+	if (algo->data[algo->size-1] != 0) {
+		/* Unterminated string */
+		for (i = tsig_info; i < last_tsig_info; i++)
+			if ((algo->size == i->strlen_name ||
+			     (algo->size - 1 == i->strlen_name &&
+			      algo->data[algo->size - 1] == '.'
+			     )
+			    )&&
+			    strncasecmp((const char *)algo->data, i->name,
+			    i->strlen_name) == 0)
+				return i->alg;
+		
+	} else if (!_getdns_bindata_is_dname(algo)) {
+		/* Terminated string */
+		for (i = tsig_info; i < last_tsig_info; i++)
+			if (algo->size - 1 == i->strlen_name &&
+			    strncasecmp((const char *)algo->data, i->name,
+			    i->strlen_name) == 0)
+				return i->alg;
+
+	} else {
+		/* fqdn, canonical_dname_compare is now safe to use! */
+		for (i = tsig_info; i < last_tsig_info; i++)
+			if (canonical_dname_compare(algo->data, i->dname) == 0)
+				return i->alg;
+	}
+	return GETDNS_NO_TSIG;
 }
 
 static void
@@ -620,17 +690,18 @@ upstream_init(getdns_upstream *upstream,
 	/* How is this upstream doing? */
 	upstream->writes_done = 0;
 	upstream->responses_received = 0;
+	upstream->keepalive_timeout = 0;
 	upstream->to_retry =  2;
 	upstream->back_off =  1;
 
 	/* For sharing a socket to this upstream with TCP  */
 	upstream->fd       = -1;
 	upstream->tls_obj  = NULL;
-	upstream->starttls_req = NULL;
 	upstream->transport = GETDNS_TRANSPORT_TCP;
 	upstream->tls_hs_state = GETDNS_HS_NONE;
 	upstream->tls_auth_failed = 0;
 	upstream->tls_auth_name[0] = '\0';
+	upstream->tls_pubkey_pinset = NULL;
 	upstream->tcp.write_error = 0;
 	upstream->loop = NULL;
 	(void) getdns_eventloop_event_init(
@@ -644,21 +715,100 @@ upstream_init(getdns_upstream *upstream,
 	upstream->has_prev_client_cookie = 0;
 	upstream->has_server_cookie = 0;
 
+	upstream->tsig_alg  = GETDNS_NO_TSIG;
+	upstream->tsig_dname_len = 0;
+	upstream->tsig_size = 0;
+
 	/* Tracking of network requests on this socket */
 	_getdns_rbtree_init(&upstream->netreq_by_query_id,
 	    net_req_query_id_cmp);
 }
 
+#ifdef USE_WINSOCK
+static getdns_return_t
+set_os_defaults_windows(struct getdns_context *context)
+{
+	char domain[1024] = "";
+	size_t upstreams_limit = 10;
+	struct addrinfo hints;
+	struct addrinfo *result;
+	getdns_upstream *upstream;
+	int s;
+
+	if (context->fchg_resolvconf == NULL) {
+		context->fchg_resolvconf =
+			GETDNS_MALLOC(context->my_mf, struct filechg);
+		if (context->fchg_resolvconf == NULL)
+			return GETDNS_RETURN_MEMORY_ERROR;
+		context->fchg_resolvconf->fn = "InvalidOnWindows";
+		context->fchg_resolvconf->prevstat = NULL;
+		context->fchg_resolvconf->changes = GETDNS_FCHG_NOCHANGES;
+		context->fchg_resolvconf->errors = GETDNS_FCHG_NOERROR;
+	}
+	_getdns_filechg_check(context, context->fchg_resolvconf);
+
+	context->upstreams = upstreams_create(context, upstreams_limit);
+
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family = AF_UNSPEC;      /* Allow IPv4 or IPv6 */
+	hints.ai_socktype = 0;              /* Datagram socket */
+	hints.ai_flags = AI_NUMERICHOST; /* No reverse name lookups */
+	hints.ai_protocol = 0;              /* Any protocol */
+	hints.ai_canonname = NULL;
+	hints.ai_addr = NULL;
+	hints.ai_next = NULL;
+
+	FIXED_INFO *info;
+	ULONG buflen = sizeof(*info);
+	IP_ADDR_STRING *ptr = 0;
+
+	info = (FIXED_INFO *)malloc(sizeof(FIXED_INFO));
+	if (info == NULL)
+		return GETDNS_RETURN_GENERIC_ERROR;
+
+	if (GetNetworkParams(info, &buflen) == ERROR_BUFFER_OVERFLOW) {
+		free(info);
+		info = (FIXED_INFO *)malloc(buflen);
+		if (info == NULL)
+			return GETDNS_RETURN_GENERIC_ERROR;
+	}
+
+	if (GetNetworkParams(info, &buflen) == NO_ERROR) {
+		ptr = info->DnsServerList.Next; 
+		*domain = 0;
+		while (ptr) {
+			for (size_t i = 0; i < GETDNS_UPSTREAM_TRANSPORTS; i++) {
+				char *port_str = getdns_port_str_array[i];
+				if ((s = getaddrinfo(ptr->IpAddress.String, port_str, &hints, &result)))
+					continue;
+				if (!result)
+					continue;
+
+				upstream = &context->upstreams->
+					upstreams[context->upstreams->count++];
+				upstream_init(upstream, context->upstreams, result);
+				upstream->transport = getdns_upstream_transports[i];
+				freeaddrinfo(result);
+			}
+			ptr = ptr->Next;
+
+		}
+		free(info);
+	}
+	return GETDNS_RETURN_GOOD;
+} /* set_os_defaults_windows */
+#else
 static getdns_return_t
 set_os_defaults(struct getdns_context *context)
 {
 	FILE *in;
 	char line[1024], domain[1024];
 	char *parse, *token, prev_ch;
-	size_t upstreams_limit = 10, length;
+	size_t upstream_count, length;
 	struct addrinfo hints;
 	struct addrinfo *result;
 	getdns_upstream *upstream;
+	getdns_list     *suffix;
 	int s;
 
 	if(context->fchg_resolvconf == NULL) {
@@ -673,8 +823,19 @@ set_os_defaults(struct getdns_context *context)
 	}
 	_getdns_filechg_check(context, context->fchg_resolvconf);
 
-	context->suffix = getdns_list_create_with_context(context);
-	context->upstreams = upstreams_create(context, upstreams_limit);
+	in = fopen(context->fchg_resolvconf->fn, "r");
+	if (!in)
+		return GETDNS_RETURN_GOOD;
+
+	upstream_count = 0;
+	while (fgets(line, (int)sizeof(line), in))
+		if (strncmp(line, "nameserver", 10) == 0)
+			upstream_count++;
+	fclose(in);
+
+	suffix = getdns_list_create_with_context(context);
+	context->upstreams = upstreams_create(
+	    context, upstream_count * GETDNS_UPSTREAM_TRANSPORTS);
 
 	in = fopen(context->fchg_resolvconf->fn, "r");
 	if (!in)
@@ -713,7 +874,7 @@ set_os_defaults(struct getdns_context *context)
 				prev_ch = *token;
 				*token = 0;
 
-				_getdns_list_append_string(context->suffix, parse);
+				_getdns_list_append_string(suffix, parse);
 
 				*token = prev_ch;
 				parse = token;
@@ -735,11 +896,6 @@ set_os_defaults(struct getdns_context *context)
 			if (!result)
 				continue;
 
-			/* Grow array when needed */
-			if (context->upstreams->count == upstreams_limit)
-				context->upstreams = upstreams_resize(
-				    context->upstreams, (upstreams_limit *= 2));
-
 			upstream = &context->upstreams->
 			    upstreams[context->upstreams->count++];
 			upstream_init(upstream, context->upstreams, result);
@@ -749,11 +905,15 @@ set_os_defaults(struct getdns_context *context)
 	}
 	fclose(in);
 
-	(void) getdns_list_get_length(context->suffix, &length);
+	(void) getdns_list_get_length(suffix, &length);
 	if (length == 0 && *domain != 0)
-		_getdns_list_append_string(context->suffix, domain);
+		_getdns_list_append_string(suffix, domain);
+	(void )getdns_context_set_suffix(context, suffix);
+	getdns_list_destroy(suffix);
+
 	return GETDNS_RETURN_GOOD;
 } /* set_os_defaults */
+#endif
 
 /* compare of transaction ids in DESCENDING order
    so that 0 comes last
@@ -851,9 +1011,11 @@ getdns_context_create_with_extended_memory_functions(
 	result->timeout = 5000;
 	result->idle_timeout = 0;
 	result->follow_redirects = GETDNS_REDIRECTS_FOLLOW;
-	result->dns_root_servers = create_default_root_servers();
+	result->dns_root_servers = NULL;
+	result->root_servers_fn[0] = 0;
 	result->append_name = GETDNS_APPEND_NAME_ALWAYS;
-	result->suffix = NULL;
+	result->suffixes = no_suffixes;
+	result->suffixes_len = sizeof(no_suffixes);
 
 	gldns_buffer_init_frm_data(&gbuf, result->trust_anchors_spc
 	                                , sizeof(result->trust_anchors_spc));
@@ -884,6 +1046,8 @@ getdns_context_create_with_extended_memory_functions(
 	result->edns_extended_rcode = 0;
 	result->edns_version = 0;
 	result->edns_do_bit = 0;
+	result->edns_client_subnet_private = 0;
+	result->tls_query_padding_blocksize = 1; /* default is to not try to pad */
 	result-> tls_ctx = NULL;
 
 	result->extension = &result->mini_event.loop;
@@ -893,8 +1057,14 @@ getdns_context_create_with_extended_memory_functions(
 	result->fchg_resolvconf = NULL;
 	result->fchg_hosts      = NULL;
 
+	// resolv.conf does not exist on Windows, handle differently
+#ifndef USE_WINSOCK 
 	if (set_from_os && (r = set_os_defaults(result)))
 		goto error;
+#else
+	if (set_from_os && (r = set_os_defaults_windows(result)))
+		goto error;
+#endif
 
 	result->dnssec_allowed_skew = 0;
 	result->edns_maximum_udp_payload_size = -1;
@@ -1013,8 +1183,13 @@ getdns_context_destroy(struct getdns_context *context)
 	if (context->tls_ctx)
 		SSL_CTX_free(context->tls_ctx);
 
-	getdns_list_destroy(context->dns_root_servers);
-	getdns_list_destroy(context->suffix);
+	if (context->dns_root_servers)
+		getdns_list_destroy(context->dns_root_servers);
+	if (context->root_servers_fn[0])
+		unlink(context->root_servers_fn);
+
+	if (context->suffixes && context->suffixes != no_suffixes)
+		GETDNS_FREE(context->mf, (void *)context->suffixes);
 
 	if (context->trust_anchors &&
 	    context->trust_anchors != context->trust_anchors_spc)
@@ -1207,37 +1382,40 @@ getdns_context_set_resolution_type(struct getdns_context *context,
  *
  */
 getdns_return_t
-getdns_context_set_namespaces(struct getdns_context *context,
+getdns_context_set_namespaces(getdns_context *context,
     size_t namespace_count, getdns_namespace_t *namespaces)
 {
 	size_t i;
+	getdns_return_t r = GETDNS_RETURN_GOOD;
 
-    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
-    if (namespace_count == 0 || namespaces == NULL) {
-        return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
-    }
+	if (!context)
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
-	for(i=0; i<namespace_count; i++)
-	{
-		if( namespaces[i] != GETDNS_NAMESPACE_DNS
-		 && namespaces[i] != GETDNS_NAMESPACE_LOCALNAMES
-		 && namespaces[i] != GETDNS_NAMESPACE_NETBIOS
-		 && namespaces[i] != GETDNS_NAMESPACE_MDNS
-		 && namespaces[i] != GETDNS_NAMESPACE_NIS)
+	if (namespace_count == 0 || namespaces == NULL)
+		return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+
+	for (i = 0; i < namespace_count; i++) {
+		if (namespaces[i] == GETDNS_NAMESPACE_NETBIOS ||
+		    namespaces[i] == GETDNS_NAMESPACE_MDNS ||
+		    namespaces[i] == GETDNS_NAMESPACE_NIS)
+			r = GETDNS_RETURN_NOT_IMPLEMENTED;
+
+		else if (namespaces[i] != GETDNS_NAMESPACE_DNS &&
+		    namespaces[i] != GETDNS_NAMESPACE_LOCALNAMES)
 			return GETDNS_RETURN_INVALID_PARAMETER;
 	}
+	GETDNS_FREE(context->my_mf, context->namespaces);
 
-    GETDNS_FREE(context->my_mf, context->namespaces);
-
-    /** duplicate **/
-    context->namespaces = GETDNS_XMALLOC(context->my_mf, getdns_namespace_t,
-        namespace_count);
-    memcpy(context->namespaces, namespaces,
-        namespace_count * sizeof(getdns_namespace_t));
+	/** duplicate **/
+	context->namespaces = GETDNS_XMALLOC(
+	    context->my_mf, getdns_namespace_t, namespace_count);
+	(void) memcpy(context->namespaces, namespaces,
+	    namespace_count * sizeof(getdns_namespace_t));
 	context->namespace_count = namespace_count;
-    dispatch_updated(context, GETDNS_CONTEXT_CODE_NAMESPACES);
 
-    return GETDNS_RETURN_GOOD;
+	dispatch_updated(context, GETDNS_CONTEXT_CODE_NAMESPACES);
+
+	return r;
 }               /* getdns_context_set_namespaces */
 
 static getdns_return_t
@@ -1251,18 +1429,17 @@ getdns_set_base_dns_transports(
 		return GETDNS_RETURN_INVALID_PARAMETER;
 
 	/* Check for valid transports and that they are used only once*/
-	int u=0,t=0,l=0,s=0;
+	int u=0,t=0,l=0;
 	for(i=0; i<transport_count; i++)
 	{
 		switch (transports[i]) {
 			case GETDNS_TRANSPORT_UDP:       u++; break;
 			case GETDNS_TRANSPORT_TCP:       t++; break;
 			case GETDNS_TRANSPORT_TLS:       l++; break;
-			case GETDNS_TRANSPORT_STARTTLS:  s++; break;
 			default: return GETDNS_RETURN_INVALID_PARAMETER;
 		}
 	}
-	if ( u>1 || t>1 || l>1 || s>1)
+	if ( u>1 || t>1 || l>1)
 		return GETDNS_RETURN_INVALID_PARAMETER;
 	
 	if (!(new_transports = GETDNS_XMALLOC(context->my_mf,
@@ -1299,7 +1476,6 @@ set_ub_dns_transport(struct getdns_context* context) {
             set_ub_string_opt(context, "do-tcp:", "yes");
             break;
         case GETDNS_TRANSPORT_TLS:
-        case GETDNS_TRANSPORT_STARTTLS:
             set_ub_string_opt(context, "do-udp:", "no");
             set_ub_string_opt(context, "do-tcp:", "yes");
             /* Find out if there is a fallback available. */
@@ -1316,15 +1492,9 @@ set_ub_dns_transport(struct getdns_context* context) {
                     break;
                 }
             }
-            if (context->dns_transports[0] == GETDNS_TRANSPORT_TLS) {
-                if (fallback == 0) 
-                    /* Use TLS if it is the only thing.*/
-                    set_ub_string_opt(context, "ssl-upstream:", "yes");
-                break;
-            } else if (fallback == 0)
-                /* Can't support STARTTLS with no fallback. This leads to
-                 * timeouts with un stub validation.... */
-                set_ub_string_opt(context, "do-tcp:", "no");
+            if (fallback == 0) 
+                /* Use TLS if it is the only thing.*/
+                set_ub_string_opt(context, "ssl-upstream:", "yes");
             break;
        default:
            return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
@@ -1381,10 +1551,6 @@ getdns_context_set_dns_transport(
 	        context->dns_transports[0] = GETDNS_TRANSPORT_TLS;
 	        context->dns_transports[1] = GETDNS_TRANSPORT_TCP;
 	       break;
-	    case GETDNS_TRANSPORT_STARTTLS_FIRST_AND_FALL_BACK_TO_TCP_KEEP_CONNECTIONS_OPEN:
-	        context->dns_transports[0] = GETDNS_TRANSPORT_STARTTLS;
-	        context->dns_transports[1] = GETDNS_TRANSPORT_TCP;
-	       break;
 	   default:
 	       return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
 	}
@@ -1435,7 +1601,7 @@ getdns_context_set_tls_authentication(getdns_context *context,
 {
     RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
     if (value != GETDNS_AUTHENTICATION_NONE && 
-        value != GETDNS_AUTHENTICATION_HOSTNAME) {
+        value != GETDNS_AUTHENTICATION_REQUIRED) {
         return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
     }
     context->tls_auth = value;
@@ -1498,9 +1664,8 @@ getdns_context_set_idle_timeout(struct getdns_context *context, uint64_t timeout
 {
     RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
 
-    if (timeout == 0) {
-        return GETDNS_RETURN_INVALID_PARAMETER;
-    }
+    /* Shuold we enforce maximum based on edns-tcp-keepalive spec? */
+    /* 0 should be allowed as that is the default.*/
 
     context->idle_timeout = timeout;
 
@@ -1515,21 +1680,21 @@ getdns_context_set_idle_timeout(struct getdns_context *context, uint64_t timeout
  *
  */
 getdns_return_t
-getdns_context_set_follow_redirects(struct getdns_context *context,
-    getdns_redirects_t value)
+getdns_context_set_follow_redirects(
+    getdns_context *context, getdns_redirects_t value)
 {
-    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
-    if (value != GETDNS_REDIRECTS_FOLLOW && value != GETDNS_REDIRECTS_DO_NOT_FOLLOW)
-        return GETDNS_RETURN_INVALID_PARAMETER;
+	if (!context)
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
-    context->follow_redirects = value;
-    if (context->resolution_type_set != 0) {
-        /* already setup */
-        return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
-    }
+	if (value != GETDNS_REDIRECTS_FOLLOW &&
+	    value != GETDNS_REDIRECTS_DO_NOT_FOLLOW)
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
-    dispatch_updated(context, GETDNS_CONTEXT_CODE_FOLLOW_REDIRECTS);
-    return GETDNS_RETURN_GOOD;
+	context->follow_redirects = value;
+
+	dispatch_updated(context, GETDNS_CONTEXT_CODE_FOLLOW_REDIRECTS);
+
+	return GETDNS_RETURN_NOT_IMPLEMENTED;
 }               /* getdns_context_set_follow_redirects */
 
 /*
@@ -1537,49 +1702,98 @@ getdns_context_set_follow_redirects(struct getdns_context *context,
  *
  */
 getdns_return_t
-getdns_context_set_dns_root_servers(struct getdns_context *context,
-    struct getdns_list * addresses)
+getdns_context_set_dns_root_servers(
+    getdns_context *context, getdns_list *addresses)
 {
-    struct getdns_list *copy = NULL;
-    size_t count = 0;
-    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
-    if (context->resolution_type_set != 0) {
-        /* already setup */
-        return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
-    }
-    if (addresses != NULL) {
-        if (_getdns_list_copy(addresses, &copy) != GETDNS_RETURN_GOOD) {
-            return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
-        }
-        addresses = copy;
-        getdns_list_get_length(addresses, &count);
-        if (count == 0) {
-            getdns_list_destroy(addresses);
-            addresses = NULL;
-        } else {
-            size_t i = 0;
-            getdns_return_t r = GETDNS_RETURN_GOOD;
-            /* validate and add ip str */
-            for (i = 0; i < count; ++i) {
-                struct getdns_dict *dict = NULL;
-                getdns_list_get_dict(addresses, i, &dict);
-                if (r != GETDNS_RETURN_GOOD) {
-                    break;
-                }
-            }
-            if (r != GETDNS_RETURN_GOOD) {
-                getdns_list_destroy(addresses);
-                return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
-            }
-        }
-    }
+	char tmpfn[FILENAME_MAX] = P_tmpdir "/getdns-root-dns-servers-XXXXXX";
+	FILE *fh;
+	int fd;
+	size_t i;
+	getdns_dict *rr_dict;
+	getdns_return_t r;
+	getdns_bindata *addr_bd;
+	char dst[2048];
+	size_t dst_len;
+	getdns_list *newlist;
 
-    getdns_list_destroy(context->dns_root_servers);
-    context->dns_root_servers = addresses;
+	if (!context)
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
-    dispatch_updated(context, GETDNS_CONTEXT_CODE_DNS_ROOT_SERVERS);
+	if (!addresses) {
+#ifdef HAVE_LIBUNBOUND
+		if (ub_ctx_set_option(
+		    context->unbound_ctx, "root-hints:", ""))
+			return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+#endif
+		if (context->dns_root_servers)
+			getdns_list_destroy(context->dns_root_servers);
+		context->dns_root_servers = NULL;
 
-    return GETDNS_RETURN_GOOD;
+		if (context->root_servers_fn[0])
+			unlink(context->root_servers_fn);
+		context->root_servers_fn[0] = 0;
+
+		dispatch_updated(
+		    context, GETDNS_CONTEXT_CODE_DNS_ROOT_SERVERS);
+		return GETDNS_RETURN_GOOD;
+	}
+	if ((fd = mkstemp(tmpfn)) < 0)
+		return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+
+	if (!(fh = fdopen(fd, "w")))
+		return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+
+	for (i=0; (!(r = getdns_list_get_dict(addresses, i, &rr_dict))); i++) {
+		dst_len = sizeof(dst);
+		if (!getdns_rr_dict2str_buf(rr_dict, dst, &dst_len))
+
+			fprintf(fh, "%s", dst);
+
+		else if (getdns_dict_get_bindata(
+		    rr_dict, "address_data", &addr_bd) &&
+		    getdns_dict_get_bindata(
+		    rr_dict, "/rdata/ipv4_address", &addr_bd) &&
+		    getdns_dict_get_bindata(
+		    rr_dict, "/rdata/ipv6_address", &addr_bd))
+
+			; /* pass */
+
+		else if (addr_bd->size == 16 &&
+		    inet_ntop(AF_INET6, addr_bd->data, dst, sizeof(dst)))
+
+			fprintf(fh, ". NS %zu.root-servers.getdnsapi.net.\n"
+			    "%zu.root-servers.getdnsapi.net. AAAA %s\n",
+			    i, i, dst);
+
+		else if (addr_bd->size == 4 &&
+		    inet_ntop(AF_INET, addr_bd->data, dst, sizeof(dst)))
+
+			fprintf(fh, ". NS %zu.root-servers.getdnsapi.net.\n"
+			    "%zu.root-servers.getdnsapi.net. A %s\n",
+			    i, i, dst);
+	}
+	fclose(fh);
+#ifdef HAVE_LIBUNBOUND
+	if (ub_ctx_set_option(
+	    context->unbound_ctx, "root-hints:", tmpfn)) {
+		unlink(tmpfn);
+		return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+	}
+#endif
+	if (_getdns_list_copy(addresses, &newlist)) {
+		unlink(tmpfn);
+		return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+	}
+	if (context->dns_root_servers)
+		getdns_list_destroy(context->dns_root_servers);
+	context->dns_root_servers = newlist;
+
+	if (context->root_servers_fn[0])
+		unlink(context->root_servers_fn);
+	(void) memcpy(context->root_servers_fn, tmpfn, strlen(tmpfn));
+
+	dispatch_updated(context, GETDNS_CONTEXT_CODE_DNS_ROOT_SERVERS);
+	return GETDNS_RETURN_GOOD;
 }               /* getdns_context_set_dns_root_servers */
 
 /*
@@ -1610,26 +1824,90 @@ getdns_context_set_append_name(struct getdns_context *context,
  *
  */
 getdns_return_t
-getdns_context_set_suffix(struct getdns_context *context, struct getdns_list * value)
+getdns_context_set_suffix(getdns_context *context, getdns_list *value)
 {
-    struct getdns_list *copy = NULL;
-    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
-    if (context->resolution_type_set != 0) {
-        /* already setup */
-        return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
-    }
-    if (value != NULL) {
-        if (_getdns_list_copy(value, &copy) != GETDNS_RETURN_GOOD) {
-            return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
-        }
-        value = copy;
-    }
-    getdns_list_destroy(context->suffix);
-    context->suffix = value;
+	getdns_return_t r;
+	size_t i;
+	gldns_buffer gbuf;
+	uint8_t buf_spc[1024], *suffixes = NULL;
+	size_t suffixes_len = 0;
+	uint8_t dname[256];
+	size_t dname_len;
+	char name_spc[1025], *name;
+	getdns_bindata *bindata;
 
-    dispatch_updated(context, GETDNS_CONTEXT_CODE_SUFFIX);
+	if (!context)
+		return GETDNS_RETURN_INVALID_PARAMETER;
 
-    return GETDNS_RETURN_GOOD;
+	if (value == NULL) {
+		if (context->suffixes && context->suffixes != no_suffixes)
+			GETDNS_FREE(context->mf, (void *)context->suffixes);
+
+		context->suffixes = no_suffixes;
+		context->suffixes_len = sizeof(no_suffixes);
+		return GETDNS_RETURN_GOOD;
+	}
+	gldns_buffer_init_frm_data(&gbuf, buf_spc, sizeof(buf_spc));
+	for (;;) {
+		for ( i = 0
+		    ; !(r = getdns_list_get_bindata(value, i, &bindata))
+		    ; i++) {
+
+			if (bindata->size == 0 || bindata->size >= sizeof(name_spc))
+				continue;
+
+			if (bindata->data[bindata->size-1] != 0) {
+				/* Unterminated string */
+				(void) memcpy(name_spc, bindata->data, bindata->size);
+				name_spc[bindata->size] = 0;
+				name = name_spc;
+			} else
+				/* Terminated string */
+				name = (char *)bindata->data;
+
+			dname_len = sizeof(dname);
+			if (gldns_str2wire_dname_buf(name, dname, &dname_len))
+				return GETDNS_RETURN_GENERIC_ERROR;
+
+			gldns_buffer_write_u8(&gbuf, dname_len);
+			gldns_buffer_write(&gbuf, dname, dname_len);
+		}
+		if (r == GETDNS_RETURN_NO_SUCH_LIST_ITEM)
+			r = GETDNS_RETURN_GOOD;
+		else
+			break;
+
+		gldns_buffer_write_u8(&gbuf, 1);
+		gldns_buffer_write_u8(&gbuf, 0);
+
+		if (gldns_buffer_begin(&gbuf) != buf_spc)
+			break;
+
+		suffixes_len = gldns_buffer_position(&gbuf);
+		if (!(suffixes = GETDNS_XMALLOC(
+		    context->mf, uint8_t, suffixes_len))) {
+			r = GETDNS_RETURN_MEMORY_ERROR;
+			break;
+		}
+		if (suffixes_len <= gldns_buffer_limit(&gbuf)) {
+			(void) memcpy (suffixes, buf_spc, suffixes_len);
+			break;
+		}
+		gldns_buffer_init_frm_data(&gbuf, suffixes, suffixes_len);
+	}
+	if (r) {
+		if (gldns_buffer_begin(&gbuf) != buf_spc)
+			GETDNS_FREE(context->mf, suffixes);
+		return r;
+	}
+	if (context->suffixes && context->suffixes != no_suffixes)
+		GETDNS_FREE(context->mf, (void *)context->suffixes);
+
+	context->suffixes = suffixes;
+	context->suffixes_len = suffixes_len;
+
+	dispatch_updated(context, GETDNS_CONTEXT_CODE_SUFFIX);
+	return GETDNS_RETURN_GOOD;
 }               /* getdns_context_set_suffix */
 
 /*
@@ -1693,7 +1971,6 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 	getdns_return_t r;
 	size_t count = 0;
 	size_t i;
-	//size_t upstreams_limit;
 	getdns_upstreams *upstreams;
 	char addrstr[1024], portstr[1024], *eos;
 	struct addrinfo hints;
@@ -1714,17 +1991,23 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 	hints.ai_addr      = NULL;
 	hints.ai_next      = NULL;
 
-	upstreams = upstreams_create(context, count*3);
-	//upstreams_limit = count; 
+	upstreams = upstreams_create(
+	    context, count * GETDNS_UPSTREAM_TRANSPORTS);
 	for (i = 0; i < count; i++) {
-		getdns_dict *dict;
+		getdns_dict    *dict;
 		getdns_bindata *address_type;
 		getdns_bindata *address_data;
 		getdns_bindata *tls_auth_name;
 		struct sockaddr_storage  addr;
 
-		getdns_bindata *scope_id;
+		getdns_bindata  *scope_id;
 		getdns_upstream *upstream;
+
+		getdns_bindata  *tsig_alg_name, *tsig_name, *tsig_key;
+		getdns_tsig_algo tsig_alg;
+		char             tsig_name_str[1024];
+		uint8_t          tsig_dname_spc[256], *tsig_dname;
+		size_t           tsig_dname_len;
 
 		if ((r = getdns_list_get_dict(upstream_list, i, &dict)))
 			goto error;
@@ -1762,6 +2045,63 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 			eos[scope_id->size] = 0;
 		}
 
+		tsig_alg_name = tsig_name = tsig_key = NULL;
+		tsig_dname = NULL;
+		tsig_dname_len = 0;
+
+		if (getdns_dict_get_bindata(dict,
+		    "tsig_algorithm", &tsig_alg_name) == GETDNS_RETURN_GOOD)
+			tsig_alg = _getdns_get_tsig_algo(tsig_alg_name);
+		else
+			tsig_alg = GETDNS_HMAC_MD5;
+
+		if (getdns_dict_get_bindata(dict, "tsig_name", &tsig_name))
+			tsig_alg = GETDNS_NO_TSIG; /* No name, no TSIG */
+
+		else if (tsig_name->size == 0)
+			tsig_alg = GETDNS_NO_TSIG;
+
+		else if (tsig_name->data[tsig_name->size - 1] != 0) {
+			/* Unterminated string */
+			if (tsig_name->size >= sizeof(tsig_name_str) - 1)
+				tsig_alg = GETDNS_NO_TSIG;
+			else {
+				(void) memcpy(tsig_name_str, tsig_name->data
+				                           , tsig_name->size);
+				tsig_name_str[tsig_name->size] = 0;
+
+				tsig_dname_len = sizeof(tsig_dname_spc);
+				if (gldns_str2wire_dname_buf(tsig_name_str,
+				    tsig_dname_spc, &tsig_dname_len))
+					tsig_alg = GETDNS_NO_TSIG;
+				else
+					tsig_dname = tsig_dname_spc;
+			}
+		} else if (!_getdns_bindata_is_dname(tsig_name)) {
+			/* Terminated string */
+			tsig_dname_len = sizeof(tsig_dname_spc);
+			if (gldns_str2wire_dname_buf(tsig_name_str,
+			    tsig_dname_spc, &tsig_dname_len))
+				tsig_alg = GETDNS_NO_TSIG;
+			else
+				tsig_dname = tsig_dname_spc;
+
+		} else if (tsig_name->size > sizeof(tsig_dname_spc))
+			tsig_alg = GETDNS_NO_TSIG;
+
+		else {
+			/* fqdn */
+			tsig_dname = memcpy(tsig_dname_spc, tsig_name->data
+			                                  , tsig_name->size);
+			tsig_dname_len = tsig_name->size;
+		}
+		if (getdns_dict_get_bindata(dict, "tsig_secret", &tsig_key))
+			tsig_alg = GETDNS_NO_TSIG; /* No key, no TSIG */
+
+		/* Don't check TSIG length contraints here.
+		 * Let the upstream decide what is secure enough.
+		 */
+
 		/* Loop to create upstreams as needed*/
 		for (size_t j = 0; j < GETDNS_UPSTREAM_TRANSPORTS; j++) {
 			uint32_t port;
@@ -1785,17 +2125,12 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 			 * already exist (in case user has specified TLS port explicitly and
 			 * to prevent duplicates) */
 
-			/* TODO[TLS]: Grow array when needed. This causes a crash later....
-			if (upstreams->count == upstreams_limit)
-				upstreams = upstreams_resize(
-				    upstreams, (upstreams_limit *= 2)); */
-
 			upstream = &upstreams->upstreams[upstreams->count];
 			upstream->addr.ss_family = addr.ss_family;
 			upstream_init(upstream, upstreams, ai);
 			upstream->transport = getdns_upstream_transports[j];
-			if (getdns_upstream_transports[j] == GETDNS_TRANSPORT_TLS ||
-			    getdns_upstream_transports[j] == GETDNS_TRANSPORT_STARTTLS) {
+			if (getdns_upstream_transports[j] == GETDNS_TRANSPORT_TLS) {
+				getdns_list *pubkey_pinset = NULL;
 				if ((r = getdns_dict_get_bindata(
 					dict, "tls_auth_name", &tls_auth_name)) == GETDNS_RETURN_GOOD) {
 					/*TODO: VALIDATE THIS STRING!*/
@@ -1804,6 +2139,35 @@ getdns_context_set_upstream_recursive_servers(struct getdns_context *context,
 						tls_auth_name->size);
 					upstream->tls_auth_name[tls_auth_name->size] = '\0';
 				}
+				if ((r = getdns_dict_get_list(dict, "tls_pubkey_pinset",
+							      &pubkey_pinset)) == GETDNS_RETURN_GOOD) {
+			   /* TODO: what if the user supplies tls_pubkey_pinset with
+			    * something other than a list? */
+					r = _getdns_get_pubkey_pinset_from_list(pubkey_pinset,
+										&(upstreams->mf),
+										&(upstream->tls_pubkey_pinset));
+					if (r != GETDNS_RETURN_GOOD)
+						goto invalid_parameter;
+				}
+			}
+			if ((upstream->tsig_alg = tsig_alg)) {
+				if (tsig_name) {
+					(void) memcpy(upstream->tsig_dname,
+					    tsig_dname, tsig_dname_len);
+					upstream->tsig_dname_len =
+						tsig_dname_len;
+				} else
+					upstream->tsig_dname_len = 0;
+
+				if (tsig_key) {
+					(void) memcpy(upstream->tsig_key,
+					    tsig_key->data, tsig_key->size);
+					upstream->tsig_size = tsig_key->size;
+				} else
+					upstream->tsig_size = 0;
+			} else {
+				upstream->tsig_dname_len = 0;
+				upstream->tsig_size = 0;
 			}
 			upstreams->count++;
 			freeaddrinfo(ai);
@@ -1906,6 +2270,46 @@ getdns_context_set_edns_do_bit(struct getdns_context *context, uint8_t value)
     return GETDNS_RETURN_GOOD;
 }               /* getdns_context_set_edns_do_bit */
 
+/*
+ * getdns_context_set_edns_client_subnet_private
+ *
+ */
+getdns_return_t
+getdns_context_set_edns_client_subnet_private(struct getdns_context *context, uint8_t value)
+{
+    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
+    /* only allow 1 */
+    if (value != 0 && value != 1) {
+        return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+    }
+
+    context->edns_client_subnet_private = value;
+
+    dispatch_updated(context, GETDNS_CONTEXT_CODE_EDNS_CLIENT_SUBNET_PRIVATE);
+
+    return GETDNS_RETURN_GOOD;
+}               /* getdns_context_set_edns_client_subnet_private */
+
+/*
+ * getdns_context_set_tls_query_padding_blocksize
+ *
+ */
+getdns_return_t
+getdns_context_set_tls_query_padding_blocksize(struct getdns_context *context, uint16_t value)
+{
+    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
+    /* only allow values between 0 and MAXIMUM_UPSTREAM_OPTION_SPACE - 4
+       (4 is for the overhead of the option itself) */
+    if (value > MAXIMUM_UPSTREAM_OPTION_SPACE - 4) {
+        return GETDNS_RETURN_CONTEXT_UPDATE_FAIL;
+    }
+
+    context->tls_query_padding_blocksize = value;
+
+    dispatch_updated(context, GETDNS_CONTEXT_CODE_TLS_QUERY_PADDING_BLOCKSIZE);
+
+    return GETDNS_RETURN_GOOD;
+}               /* getdns_context_set_tls_query_padding_blocksize */
 /*
  * getdns_context_set_extended_memory_functions
  *
@@ -2143,13 +2547,34 @@ ub_setup_stub(struct ub_ctx *ctx, getdns_context *context)
 }
 #endif
 
+
+#ifdef HAVE_LIBUNBOUND
+static getdns_return_t
+ub_setup_recursing(struct ub_ctx *ctx, getdns_context *context)
+{
+	_getdns_rr_iter rr_spc, *rr;
+	char ta_str[8192];
+
+	(void) ub_ctx_set_fwd(ctx, NULL);
+	if (!context->unbound_ta_set && context->trust_anchors) {
+		for ( rr = _getdns_rr_iter_init( &rr_spc
+		                               , context->trust_anchors
+		                               , context->trust_anchors_len)
+		    ; rr ; rr = _getdns_rr_iter_next(rr) ) {
+
+			(void) gldns_wire2str_rr_buf((UNCONST_UINT8_p)rr->pos,
+			    rr->nxt - rr->pos, ta_str, sizeof(ta_str));
+			(void) ub_ctx_add_ta(ctx, ta_str);
+		}
+		context->unbound_ta_set = 1;
+	}
+	return GETDNS_RETURN_GOOD;
+}
+#endif
+
 static getdns_return_t
 _getdns_ns_dns_setup(struct getdns_context *context)
 {
-#ifdef HAVE_LIBUNBOUND
-	_getdns_rr_iter rr_spc, *rr;
-	char ta_str[8192];
-#endif
 	assert(context);
 
 	switch (context->resolution_type) {
@@ -2157,31 +2582,20 @@ _getdns_ns_dns_setup(struct getdns_context *context)
 		if (!context->upstreams || !context->upstreams->count)
 			return GETDNS_RETURN_GENERIC_ERROR;
 #ifdef STUB_NATIVE_DNSSEC
+#ifdef DNSSEC_ROADBLOCK_AVOIDANCE
+		return ub_setup_recursing(context->unbound_ctx, context);
+#else
 		return GETDNS_RETURN_GOOD;
+#endif
 #else
 		return ub_setup_stub(context->unbound_ctx, context);
 #endif
 
 	case GETDNS_RESOLUTION_RECURSING:
 #ifdef HAVE_LIBUNBOUND
-		/* TODO: use the root servers via root hints file */
-		(void) ub_ctx_set_fwd(context->unbound_ctx, NULL);
-		if (!context->unbound_ta_set && context->trust_anchors) {
-			for ( rr = _getdns_rr_iter_init( &rr_spc
-						, context->trust_anchors
-						, context->trust_anchors_len)
-			    ; rr ; rr = _getdns_rr_iter_next(rr) ) {
-
-				(void) gldns_wire2str_rr_buf(rr->pos,
-				    rr->nxt - rr->pos, ta_str, sizeof(ta_str));
-				(void) ub_ctx_add_ta(
-				    context->unbound_ctx, ta_str);
-			}
-			context->unbound_ta_set = 1;
-		}
-		return GETDNS_RETURN_GOOD;
+		return ub_setup_recursing(context->unbound_ctx, context);
 #else
-		return GETDNS_RETURN_GENERIC_ERROR;
+		return GETDNS_RETURN_NOT_IMPLEMENTED;
 #endif
 	}
 	return GETDNS_RETURN_BAD_CONTEXT;
@@ -2201,16 +2615,20 @@ _getdns_context_prepare_for_resolution(struct getdns_context *context,
 
 	/* Transport can in theory be set per query in stub mode */
 	if (context->resolution_type == GETDNS_RESOLUTION_STUB && 
-		tls_is_in_transports_list(context) == 1) {
+	    tls_is_in_transports_list(context) == 1) {
 		if (context->tls_ctx == NULL) {
 #ifdef HAVE_TLS_v1_2
 			/* Create client context, use TLS v1.2 only for now */
 			context->tls_ctx = SSL_CTX_new(TLSv1_2_client_method());
 			if(context->tls_ctx == NULL)
+#ifndef USE_WINSOCK
 				return GETDNS_RETURN_BAD_CONTEXT;
+#else
+				printf("Warning! Bad TLS context, check openssl version on Windows!\n");;
+#endif
 			/* Be strict and only use the cipher suites recommended in RFC7525
-			   Unless we later fallback to oppotunistic. */
-			const char* const PREFERRED_CIPHERS = "EECDH+aRSA+AESGCM:EDH+aRSA+AESGCM";
+			   Unless we later fallback to opportunistic. */
+			const char* const PREFERRED_CIPHERS = "EECDH+aRSA+AESGCM:EECDH+aECDSA+AESGCM:EDH+aRSA+AESGCM";
 			if (!SSL_CTX_set_cipher_list(context->tls_ctx, PREFERRED_CIPHERS))
 				return GETDNS_RETURN_BAD_CONTEXT;
 			if (!SSL_CTX_set_default_verify_paths(context->tls_ctx))
@@ -2223,8 +2641,8 @@ _getdns_context_prepare_for_resolution(struct getdns_context *context,
 #endif
 		}
 		if (tls_only_is_in_transports_list(context) == 1 && 
-		    context->tls_auth == GETDNS_AUTHENTICATION_HOSTNAME) {
-			context->tls_auth_min = GETDNS_AUTHENTICATION_HOSTNAME;
+		    context->tls_auth == GETDNS_AUTHENTICATION_REQUIRED) {
+			context->tls_auth_min = GETDNS_AUTHENTICATION_REQUIRED;
 			/* TODO: If no auth data provided for any upstream, fail here */
 		}
 		else {
@@ -2232,9 +2650,9 @@ _getdns_context_prepare_for_resolution(struct getdns_context *context,
 		}
 	}
 
-	/* Block use of STARTTLS/TLS ONLY in recursive mode as it won't work */
+	/* Block use of TLS ONLY in recursive mode as it won't work */
     /* Note: If TLS is used in recursive mode this will try TLS on port
-     * 53 so it is blocked here.  So is 'STARTTLS only' at the moment. */
+     * 53 so it is blocked here. */
 	if (context->resolution_type == GETDNS_RESOLUTION_RECURSING &&
 		tls_only_is_in_transports_list(context) == 1)
 		return GETDNS_RETURN_BAD_CONTEXT;
@@ -2336,8 +2754,7 @@ _getdns_strdup(const struct mem_funcs *mfs, const char *s)
 }
 
 struct getdns_bindata *
-_getdns_bindata_copy(struct mem_funcs *mfs,
-    const struct getdns_bindata *src)
+_getdns_bindata_copy(struct mem_funcs *mfs, size_t size, const uint8_t *data)
 {
 	/* Don't know why, but nodata allows
 	 * empty bindatas with the python bindings
@@ -2345,20 +2762,16 @@ _getdns_bindata_copy(struct mem_funcs *mfs,
 	static uint8_t nodata[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 	struct getdns_bindata *dst;
 
-	if (!src)
-		return NULL;
-
 	if (!(dst = GETDNS_MALLOC(*mfs, struct getdns_bindata)))
 		return NULL;
 
-	dst->size = src->size;
-	if ((dst->size = src->size)) {
-		dst->data = GETDNS_XMALLOC(*mfs, uint8_t, src->size);
+	if ((dst->size = size)) {
+		dst->data = GETDNS_XMALLOC(*mfs, uint8_t, size);
 		if (!dst->data) {
 			GETDNS_FREE(*mfs, dst);
 			return NULL;
 		}
-		(void) memcpy(dst->data, src->data, src->size);
+		(void) memcpy(dst->data, data, size);
 	} else {
 		dst->data = nodata;
 	}
@@ -2498,9 +2911,12 @@ upstream_port(getdns_upstream *upstream)
 }
 
 static getdns_dict*
-_get_context_settings(getdns_context* context) {
+_get_context_settings(getdns_context* context)
+{
     getdns_return_t r = GETDNS_RETURN_GOOD;
     getdns_dict* result = getdns_dict_create_with_context(context);
+	getdns_list *list;
+
     if (!result) {
         return NULL;
     }
@@ -2517,38 +2933,14 @@ _get_context_settings(getdns_context* context) {
     r |= getdns_dict_set_int(result, "edns_do_bit", context->edns_do_bit);
     r |= getdns_dict_set_int(result, "append_name", context->append_name);
     /* list fields */
-    if (context->suffix) r |= getdns_dict_set_list(result, "suffix", context->suffix);
-	if (context->upstreams && context->upstreams->count > 0) {
-		size_t i;
-		getdns_upstream *upstream;
-		getdns_list *upstreams =
-		    getdns_list_create_with_context(context);
-
-		for (i = 0; i < context->upstreams->count;) {
-			size_t j;
-			getdns_dict *d;
-			upstream = &context->upstreams->upstreams[i];
-			d = sockaddr_dict(context,
-			    (struct sockaddr *)&upstream->addr);
-			for ( j = 1, i++
-			    ; j < GETDNS_UPSTREAM_TRANSPORTS &&
-			      i < context->upstreams->count
-			    ; j++, i++) {
-
-				upstream = &context->upstreams->upstreams[i];
-				if (upstream->transport != GETDNS_TRANSPORT_TLS)
-					continue;
-				if (upstream_port(upstream) != getdns_port_array[j])
-					continue;
-				(void) getdns_dict_set_int(d, "tls_port",
-				    (uint32_t) upstream_port(upstream));
-			}
-			r |= _getdns_list_append_dict(upstreams, d);
-			getdns_dict_destroy(d);
-		}
+	if (!getdns_context_get_suffix(context, &list)) {
+		r |= getdns_dict_set_list(result, "suffix", list);
+		getdns_list_destroy(list);
+	}
+	if (!getdns_context_get_upstream_recursive_servers(context, &list)) {
 		r |= getdns_dict_set_list(result, "upstream_recursive_servers",
-		    upstreams);
-		getdns_list_destroy(upstreams);
+		    list);
+		getdns_list_destroy(list);
 	}
     if (context->dns_transport_count > 0) {
         /* create a namespace list */
@@ -2560,6 +2952,7 @@ _get_context_settings(getdns_context* context) {
             }
             r |= getdns_dict_set_list(result, "dns_transport_list", transports);
         }
+        r |= getdns_dict_set_int(result, "tls_authentication", context->tls_auth);
     }
     if (context->namespace_count > 0) {
         /* create a namespace list */
@@ -2778,12 +3171,6 @@ getdns_context_get_dns_transport(getdns_context *context,
         else
             return GETDNS_RETURN_WRONG_TYPE_REQUESTED;
     }
-    if (transports[0] == GETDNS_TRANSPORT_STARTTLS) {
-        if (count == 2 && transports[1] == GETDNS_TRANSPORT_TCP)
-            *value = GETDNS_TRANSPORT_STARTTLS_FIRST_AND_FALL_BACK_TO_TCP_KEEP_CONNECTIONS_OPEN;
-        else
-            return GETDNS_RETURN_WRONG_TYPE_REQUESTED;
-    }
     return GETDNS_RETURN_GOOD;
 }
 
@@ -2802,6 +3189,15 @@ getdns_context_get_dns_transport_list(getdns_context *context,
     *transports = malloc(context->dns_transport_count * sizeof(getdns_transport_list_t));
     memcpy(*transports, context->dns_transports,
            context->dns_transport_count * sizeof(getdns_transport_list_t));
+    return GETDNS_RETURN_GOOD;
+}
+
+getdns_return_t
+getdns_context_get_tls_authentication(getdns_context *context,
+    getdns_tls_authentication_t* value) {
+    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
+    RETURN_IF_NULL(value, GETDNS_RETURN_INVALID_PARAMETER);
+    *value = context->tls_auth;
     return GETDNS_RETURN_GOOD;
 }
 
@@ -2831,12 +3227,13 @@ getdns_context_get_idle_timeout(getdns_context *context, uint64_t* value) {
 }
 
 getdns_return_t
-getdns_context_get_follow_redirects(getdns_context *context,
-    getdns_redirects_t* value) {
-    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
-    RETURN_IF_NULL(value, GETDNS_RETURN_INVALID_PARAMETER);
-    *value = context->follow_redirects;
-    return GETDNS_RETURN_GOOD;
+getdns_context_get_follow_redirects(
+    getdns_context *context, getdns_redirects_t* value)
+{
+	if (!context || !value)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+	*value = context->follow_redirects;
+	return GETDNS_RETURN_NOT_IMPLEMENTED;
 }
 
 getdns_return_t
@@ -2845,9 +3242,8 @@ getdns_context_get_dns_root_servers(getdns_context *context,
     RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
     RETURN_IF_NULL(value, GETDNS_RETURN_INVALID_PARAMETER);
     *value = NULL;
-    if (context->dns_root_servers) {
+    if (context->dns_root_servers)
         return _getdns_list_copy(context->dns_root_servers, value);
-    }
     return GETDNS_RETURN_GOOD;
 }
 
@@ -2861,14 +3257,41 @@ getdns_context_get_append_name(getdns_context *context,
 }
 
 getdns_return_t
-getdns_context_get_suffix(getdns_context *context, getdns_list **value) {
-    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
-    RETURN_IF_NULL(value, GETDNS_RETURN_INVALID_PARAMETER);
-    *value = NULL;
-    if (context->suffix) {
-        return _getdns_list_copy(context->suffix, value);
-    }
-    return GETDNS_RETURN_GOOD;
+getdns_context_get_suffix(getdns_context *context, getdns_list **value)
+{
+	size_t dname_len;
+	const uint8_t *dname;
+	char name[1024];
+	getdns_return_t r = GETDNS_RETURN_GOOD;
+	getdns_list *list;
+
+	if (!context || !value)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	if (!(list = getdns_list_create_with_context(context)))
+		return GETDNS_RETURN_MEMORY_ERROR;
+	
+	assert(context->suffixes);
+	dname_len = context->suffixes[0];
+	dname = context->suffixes + 1;
+	while (dname_len && *dname) {
+		if (! gldns_wire2str_dname_buf((UNCONST_UINT8_p)
+		    dname, dname_len, name, sizeof(name))) {
+			r = GETDNS_RETURN_GENERIC_ERROR;
+			break;
+		}
+		if ((r = _getdns_list_append_const_bindata(
+		    list, strlen(name) + 1, name)))
+			break;
+		dname += dname_len;
+		dname_len = *dname++;
+	}
+	if (r)
+		getdns_list_destroy(list);
+	else
+		*value = list;
+
+	return GETDNS_RETURN_GOOD;
 }
 
 getdns_return_t
@@ -2902,43 +3325,95 @@ getdns_context_get_dnssec_allowed_skew(getdns_context *context,
 
 getdns_return_t
 getdns_context_get_upstream_recursive_servers(getdns_context *context,
-    getdns_list **upstream_list) {
-    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
-    RETURN_IF_NULL(upstream_list, GETDNS_RETURN_INVALID_PARAMETER);
-    *upstream_list = NULL;
-    if (context->upstreams && context->upstreams->count > 0) {
-        getdns_return_t r = GETDNS_RETURN_GOOD;
-        size_t i;
-        getdns_upstream *upstream;
-        getdns_list *upstreams = getdns_list_create();
-        for (i = 0; i < context->upstreams->count;) {
+    getdns_list **upstreams_r)
+{
+	size_t i;
+	getdns_list *upstreams;
+	getdns_return_t r;
+
+	if (!context || !upstreams_r)
+		return GETDNS_RETURN_INVALID_PARAMETER;
+
+	if (!(upstreams = getdns_list_create_with_context(context)))
+		return GETDNS_RETURN_MEMORY_ERROR;
+
+	if (!context->upstreams || context->upstreams->count == 0) {
+		*upstreams_r = upstreams;
+		return GETDNS_RETURN_GOOD;
+	}
+	r = GETDNS_RETURN_GOOD;
+	i = 0;
+	while (!r && i < context->upstreams->count) {
 		size_t j;
 		getdns_dict *d;
-		upstream = &context->upstreams->upstreams[i];
-		d = sockaddr_dict(context, (struct sockaddr *)&upstream->addr);
+		getdns_upstream  *upstream = &context->upstreams->upstreams[i];
+		getdns_bindata    bindata;
+		const getdns_tsig_info *tsig_info;
+
+		if (!(d =
+		    sockaddr_dict(context, (struct sockaddr*)&upstream->addr))) {
+			r = GETDNS_RETURN_MEMORY_ERROR;
+			break;
+		}
+		if (upstream->tsig_alg) {
+			tsig_info = _getdns_get_tsig_info(upstream->tsig_alg);
+
+			if ((r = _getdns_dict_set_const_bindata(
+			    d, "tsig_algorithm",
+			    tsig_info->dname_len, tsig_info->dname)))
+				break;
+
+			if (upstream->tsig_dname_len) {
+				bindata.data = upstream->tsig_dname;
+				bindata.size = upstream->tsig_dname_len;
+				if ((r = getdns_dict_set_bindata(
+				    d, "tsig_name", &bindata)))
+					break;
+			}
+			if (upstream->tsig_size) {
+				bindata.data = upstream->tsig_key;
+				bindata.size = upstream->tsig_size;
+				if ((r = getdns_dict_set_bindata(
+				    d, "tsig_secret", &bindata)))
+					break;
+			}
+		}
 		for ( j = 1, i++
 		    ; j < GETDNS_UPSTREAM_TRANSPORTS &&
 		      i < context->upstreams->count
 		    ; j++, i++) {
 
 			upstream = &context->upstreams->upstreams[i];
-			if (upstream->transport != GETDNS_TRANSPORT_TLS)
-				continue;
-			if (upstream_port(upstream) != getdns_port_array[j])
-				continue;
-			(void) getdns_dict_set_int(d, "tls_port",
-			    (uint32_t) upstream_port(upstream));
+
+			if (upstream->transport == GETDNS_TRANSPORT_UDP &&
+			    upstream_port(upstream) != getdns_port_array[j] &&
+			    (r = getdns_dict_set_int(d, "port",
+			    (uint32_t)upstream_port(upstream))))
+				break;
+
+			if (upstream->transport == GETDNS_TRANSPORT_TLS) {
+				if (upstream_port(upstream) == getdns_port_array[j])
+					(void) getdns_dict_set_int(d, "tls_port",
+								   (uint32_t) upstream_port(upstream));
+				if (upstream->tls_pubkey_pinset) {
+					getdns_list *pins = NULL;
+					if (_getdns_get_pubkey_pinset_list(context,
+									   upstream->tls_pubkey_pinset,
+									   &pins) == GETDNS_RETURN_GOOD)
+						(void) getdns_dict_set_list(d, "tls_pubkey_pinset", pins);
+					getdns_list_destroy(pins);
+				}
+			}
 		}
-		r |= _getdns_list_append_dict(upstreams, d);
+		if (!r)
+			r = _getdns_list_append_dict(upstreams, d);
 		getdns_dict_destroy(d);
         }
-        if (r != GETDNS_RETURN_GOOD) {
-            getdns_list_destroy(upstreams);
-            return GETDNS_RETURN_MEMORY_ERROR;
-        }
-        *upstream_list = upstreams;
-    }
-    return GETDNS_RETURN_GOOD;
+        if (r)
+		getdns_list_destroy(upstreams);
+	else
+		*upstreams_r = upstreams;
+	return r;
 }
 
 getdns_return_t
@@ -2972,6 +3447,22 @@ getdns_context_get_edns_do_bit(getdns_context *context, uint8_t* value) {
     RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
     RETURN_IF_NULL(value, GETDNS_RETURN_INVALID_PARAMETER);
     *value = context->edns_do_bit;
+    return GETDNS_RETURN_GOOD;
+}
+
+getdns_return_t
+getdns_context_get_edns_client_subnet_private(getdns_context *context, uint8_t* value) {
+    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
+    RETURN_IF_NULL(value, GETDNS_RETURN_INVALID_PARAMETER);
+    *value = context->edns_client_subnet_private;
+    return GETDNS_RETURN_GOOD;
+}
+
+getdns_return_t
+getdns_context_get_tls_query_padding_blocksize(getdns_context *context, uint16_t* value) {
+    RETURN_IF_NULL(context, GETDNS_RETURN_INVALID_PARAMETER);
+    RETURN_IF_NULL(value, GETDNS_RETURN_INVALID_PARAMETER);
+    *value = context->tls_query_padding_blocksize;
     return GETDNS_RETURN_GOOD;
 }
 

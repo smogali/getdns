@@ -32,10 +32,11 @@
 AC_PREREQ([2.56])
 AC_CONFIG_MACRO_DIRS([m4])
 sinclude(./m4/acx_openssl.m4)
+sinclude(./m4/acx_getaddrinfo.m4)
 sinclude(./m4/ax_check_compile_flag.m4)
 sinclude(./m4/pkg.m4)
 
-AC_INIT([getdns], [0.5.0], [stub-resolver@verisignlabs.com], [], [https://getdnsapi.net])
+AC_INIT([getdns], [0.9.0], [stub-resolver@verisignlabs.com], [], [https://getdnsapi.net])
 AC_SUBST(RELEASE_CANDIDATE, [])
 
 # Set current date from system if not set
@@ -46,9 +47,9 @@ AC_ARG_WITH([current-date],
   [CURRENT_DATE="`date -u +%Y-%m-%dT%H:%M:%SZ`"])
 
 AC_SUBST(GETDNS_VERSION, ["AC_PACKAGE_VERSION$RELEASE_CANDIDATE"])
-AC_SUBST(GETDNS_NUMERIC_VERSION, [0x00050000])
-AC_SUBST(API_VERSION, ["October 2015"])
-AC_SUBST(API_NUMERIC_VERSION, [0x07df0a00])
+AC_SUBST(GETDNS_NUMERIC_VERSION, [0x00090000])
+AC_SUBST(API_VERSION, ["December 2015"])
+AC_SUBST(API_NUMERIC_VERSION, [0x07df0c00])
 GETDNS_COMPILATION_COMMENT="AC_PACKAGE_NAME $GETDNS_VERSION configured on $CURRENT_DATE for the $API_VERSION version of the API"
 
 
@@ -74,8 +75,10 @@ GETDNS_COMPILATION_COMMENT="AC_PACKAGE_NAME $GETDNS_VERSION configured on $CURRE
 # getdns-0.3.2 had libversion 3:5:2
 # getdns-0.3.3 had libversion 3:6:2
 # getdns-0.5.0 had libversion 4:0:3
+# getdns-0.5.1 had libversion 4:1:3 (but should have been getdns-0.6.0)
+# getdns-0.9.0 will have libversion 5:0:4
 #
-GETDNS_LIBVERSION=4:0:3
+GETDNS_LIBVERSION=5:0:4
 
 AC_SUBST(GETDNS_COMPILATION_COMMENT)
 AC_SUBST(GETDNS_LIBVERSION)
@@ -96,7 +99,7 @@ AX_CHECK_COMPILE_FLAG([-xc99],[CFLAGS="$CFLAGS -xc99"],[],[])
 AX_CHECK_COMPILE_FLAG([-Wall],[CFLAGS="$CFLAGS -Wall"],[],[])
 
 case "$host_os" in
-  linux* ) CFLAGS="$CFLAGS -D_BSD_SOURCE"
+  linux* ) CFLAGS="$CFLAGS -D_BSD_SOURCE -D_DEFAULT_SOURCE"
   ;;
   solaris* ) CFLAGS="$CFLAGS -D__EXTENSIONS__"  # for strdup() from <string.h>
   ;;
@@ -136,7 +139,20 @@ fi
 ])
 ACX_ARG_RPATH
 
+
 AC_ARG_ENABLE(debug-sched, AC_HELP_STRING([--enable-debug-sched], [Enable scheduling debugging messages]))
+AC_ARG_ENABLE(debug-stub, AC_HELP_STRING([--enable-debug-stub], [Enable stub debugging messages]))
+AC_ARG_ENABLE(debug-sec, AC_HELP_STRING([--enable-debug-sec], [Enable dnssec debugging messages]))
+AC_ARG_ENABLE(all-debugging, AC_HELP_STRING([--enable-all-debugging], [Enable scheduling, stub and dnssec debugging]))
+case "$enable_all_debugging" in
+	yes)
+		enable_debug_sched=yes
+		enable_debug_stub=yes
+		enable_debug_sec=yes
+		;;
+	no|*)
+		;;
+esac
 case "$enable_debug_sched" in
 	yes)
 		AC_DEFINE_UNQUOTED([SCHED_DEBUG], [1], [Define this to enable printing of scheduling debugging messages.])
@@ -144,7 +160,6 @@ case "$enable_debug_sched" in
 	no|*)
 		;;
 esac
-AC_ARG_ENABLE(debug-stub, AC_HELP_STRING([--enable-debug-stub], [Enable stub debugging messages]))
 case "$enable_debug_stub" in
 	yes)
 		AC_DEFINE_UNQUOTED([STUB_DEBUG], [1], [Define this to enable printing of stub debugging messages.])
@@ -152,7 +167,6 @@ case "$enable_debug_stub" in
 	no|*)
 		;;
 esac
-AC_ARG_ENABLE(debug-sec, AC_HELP_STRING([--enable-debug-sec], [Enable dnssec debugging messages]))
 case "$enable_debug_sec" in
 	yes)
 		AC_DEFINE_UNQUOTED([SEC_DEBUG], [1], [Define this to enable printing of dnssec debugging messages.])
@@ -161,29 +175,22 @@ case "$enable_debug_sec" in
 		;;
 esac
 
-AC_ARG_ENABLE(tcp-fastopen, AC_HELP_STRING([--enable-tcp-fastopen], [Enable TCP Fast Open]))
-case "$enable_tcp_fastopen" in
-	yes)
-		AC_CHECK_DECL([MSG_FASTOPEN], [], [AC_MSG_ERROR([TCP Fast Open is not available: please rerun without --enable-tcp-fastopen])], [AC_INCLUDES_DEFAULT
-#include <sys/socket.h>
-		])
-		AC_DEFINE_UNQUOTED([USE_TCP_FASTOPEN], [1], [Define this to enable TCP fast open.])
-		;;
-	no|*)
-		;;
-esac
-
-# Not yet enabled by default as crash found when TCP fails.
-# AC_ARG_ENABLE(tcp-fastopen, AC_HELP_STRING([--disable-tcp-fastopen], Disable TCP Fast Open (default=enabled if available)),
-# 	enable_tcp_fastopen="$enableval", enable_tcp_fastopen=yes)
-# if test "x$enable_tcp_fastopen" = xno; then
-# 		AC_MSG_WARN([TCP Fast Open is disabled])
-# else
-# 		AC_CHECK_DECL([MSG_FASTOPEN], [AC_DEFINE_UNQUOTED([USE_TCP_FASTOPEN], [1], [Define this to enable TCP fast open.])],
-# 		              [AC_MSG_WARN([TCP Fast Open is not available.])], [AC_INCLUDES_DEFAULT
-# #include <sys/socket.h>
-# 		])
-# fi
+AC_ARG_ENABLE(tcp-fastopen, AC_HELP_STRING([--disable-tcp-fastopen], Disable TCP Fast Open (default=enabled if available)),
+    enable_tcp_fastopen="$enableval", enable_tcp_fastopen=yes)
+if test "x$enable_tcp_fastopen" = xno; then
+        AC_MSG_WARN([TCP Fast Open is disabled])
+else
+    case `uname` in
+        Linux) AC_CHECK_DECL([MSG_FASTOPEN], [AC_DEFINE_UNQUOTED([USE_TCP_FASTOPEN], [1], [Define this to enable TCP fast open.])],
+                          [AC_MSG_WARN([TCP Fast Open is not available, continuing without])], [#include <sys/socket.h>])
+          ;;
+        Darwin) AC_CHECK_DECL([CONNECT_RESUME_ON_READ_WRITE], [AC_DEFINE_UNQUOTED([USE_OSX_TCP_FASTOPEN], [1], [Define this to enable TCP fast open.])],
+                      [AC_MSG_WARN([TCP Fast Open is not available, continuing without])], [#include <sys/socket.h>])
+          ;;
+        *) AC_MSG_WARN([TCP Fast Open is not available, continuing without])
+          ;;
+    esac
+fi
 
 AC_ARG_ENABLE(native-stub-dnssec, AC_HELP_STRING([--disable-native-stub-dnssec], [Disable native stub DNSSEC support]))
 case "$enable_native_stub_dnssec" in
@@ -211,7 +218,7 @@ else
 fi
 AC_CHECK_HEADERS([openssl/conf.h],,, [AC_INCLUDES_DEFAULT])
 AC_CHECK_HEADERS([openssl/engine.h],,, [AC_INCLUDES_DEFAULT])
-AC_CHECK_FUNCS([OPENSSL_config EVP_sha1 EVP_sha256 EVP_sha512 FIPS_mode])
+AC_CHECK_FUNCS([OPENSSL_config EVP_md5 EVP_sha1 EVP_sha224 EVP_sha256 EVP_sha384 EVP_sha512 FIPS_mode])
 AC_CHECK_DECLS([SSL_COMP_get_compression_methods,sk_SSL_COMP_pop_free,SSL_CTX_set_ecdh_auto], [], [], [
 AC_INCLUDES_DEFAULT
 #ifdef HAVE_OPENSSL_ERR_H
@@ -393,8 +400,24 @@ case "$enable_ecdsa" in
 esac
 
 
-
+AC_ARG_ENABLE(draft-dnssec-roadblock-avoidance, AC_HELP_STRING([--enable-draft-dnssec-roadblock-avoidance], [Enable experimental dnssec roadblock avoidance]))
 AC_ARG_ENABLE(draft-edns-cookies, AC_HELP_STRING([--enable-draft-edns-cookies], [Enable experimental edns cookies]))
+AC_ARG_ENABLE(all-drafts, AC_HELP_STRING([--enable-all-drafts], [Enable cookies and roadblock avoidance]))
+case "$enable_all_drafts" in
+	yes)
+		enable_draft_dnssec_roadblock_avoidance=yes
+		enable_draft_edns_cookies=yes
+		;;
+	no|*)
+		;;
+esac
+case "$enable_draft_dnssec_roadblock_avoidance" in
+	yes)
+		AC_DEFINE_UNQUOTED([DNSSEC_ROADBLOCK_AVOIDANCE], [1], [Define this to enable the experimental draft dnssec roadblock avoidance.])
+		;;
+	no|*)
+		;;
+esac
 case "$enable_draft_edns_cookies" in
 	yes)
 		if test "x_$HAVE_SSL" != "x_yes"; then
@@ -408,6 +431,9 @@ esac
 AC_DEFINE_UNQUOTED([EDNS_COOKIE_OPCODE], [10], [The edns cookie option code.])
 AC_DEFINE_UNQUOTED([EDNS_COOKIE_ROLLOVER_TIME], [(24 * 60 * 60)], [How often the edns client cookie is refreshed.])
 
+AC_DEFINE_UNQUOTED([MAXIMUM_UPSTREAM_OPTION_SPACE], [3000], [limit for dynamically-generated DNS options])
+AC_DEFINE_UNQUOTED([EDNS_PADDING_OPCODE], [12], [The edns padding option code.])
+
 my_with_libunbound=1
 AC_ARG_ENABLE(stub-only, AC_HELP_STRING([--enable-stub-only], [Restricts resolution modes to STUB (which will be the default mode).  Removes the libunbound dependency.]))
 case "$enable_stub_only" in
@@ -419,37 +445,53 @@ case "$enable_stub_only" in
 esac
 
 # search to set include and library paths right
-# find libidn
-my_with_libidn=1
-AC_ARG_WITH(libidn, AS_HELP_STRING([--with-libidn=pathname],
-	[path to libidn (default: search /usr/local ..)]),
-	[], [withval="yes"])
-if test x_$withval = x_yes; then
-	for dir in /usr/local /opt/local /usr/pkg /usr/sfw; do
-		if test -f "$dir/include/idna.h"; then
-			CFLAGS="$CFLAGS -I$dir/include"
-			LDFLAGS="$LDFLAGS -L$dir/lib"
-			AC_MSG_NOTICE([Found libidn in $dir])
-			break
-		fi
-		if test -f "$dir/include/idn/idna.h"; then
-			CFLAGS="$CFLAGS -I$dir/include/idn"
-			LDFLAGS="$LDFLAGS -L$dir/lib"
-			AC_MSG_NOTICE([Found libidn in $dir])
-			break
-		fi
-	done
-	if test -f "/usr/include/idn/idna.h"; then
-		CFLAGS="$CFLAGS -I/usr/include/idn"
-		#LDFLAGS="$LDFLAGS -L/usr/lib"
-		AC_MSG_NOTICE([Found libidn in /usr])
-	fi
+# find libidn (no libidn on windows though)
+AC_CHECK_HEADERS([windows.h winsock.h stdio.h winsock2.h ws2tcpip.h],,, [AC_INCLUDES_DEFAULT])
+ACX_CHECK_GETADDRINFO_WITH_INCLUDES
+if test "$USE_WINSOCK" = 1; then
+	AC_MSG_NOTICE([ Building on Windows ... YES! ])
+	AC_DEFINE_UNQUOTED([GETDNS_ON_WINDOWS], [1], [Define this to enable Windows build.])
+	AC_DEFINE_UNQUOTED([STUB_NATIVE_DNSSEC], [1])
+	LIBS="$LIBS -lgdi32 -liphlpapi"
+	my_with_libunbound=0
+	my_with_libidn=0
 else
-	if test x_$withval != x_no; then
-		CFLAGS="$CFLAGS -I$withval/include"
-		LDFLAGS="$LDFLAGS -L$withval/lib"
+	my_with_libidn=1
+fi
+
+
+if test $my_with_libidn = 1
+then
+	AC_ARG_WITH(libidn, AS_HELP_STRING([--with-libidn=pathname],
+		[path to libidn (default: search /usr/local ..)]),
+		[], [withval="yes"])
+	if test x_$withval = x_yes; then
+		for dir in /usr/local /opt/local /usr/pkg /usr/sfw; do
+			if test -f "$dir/include/idna.h"; then
+				CFLAGS="$CFLAGS -I$dir/include"
+				LDFLAGS="$LDFLAGS -L$dir/lib"
+				AC_MSG_NOTICE([Found libidn in $dir])
+				break
+			fi
+			if test -f "$dir/include/idn/idna.h"; then
+				CFLAGS="$CFLAGS -I$dir/include/idn"
+				LDFLAGS="$LDFLAGS -L$dir/lib"
+				AC_MSG_NOTICE([Found libidn in $dir])
+				break
+			fi
+		done
+		if test -f "/usr/include/idn/idna.h"; then
+			CFLAGS="$CFLAGS -I/usr/include/idn"
+			#LDFLAGS="$LDFLAGS -L/usr/lib"
+			AC_MSG_NOTICE([Found libidn in /usr])
+		fi
 	else
-		my_with_libidn=0
+		if test x_$withval != x_no; then
+			CFLAGS="$CFLAGS -I$withval/include"
+			LDFLAGS="$LDFLAGS -L$withval/lib"
+		else
+			my_with_libidn=0
+		fi
 	fi
 fi
 
@@ -866,7 +908,7 @@ AC_SUBST(GETDNS_QUERY)
 AC_SUBST(INSTALL_GETDNS_QUERY)
 AC_SUBST(UNINSTALL_GETDNS_QUERY)
 
-AC_CONFIG_FILES([Makefile src/Makefile src/version.c src/getdns/getdns.h src/getdns/getdns_extra.h spec/example/Makefile src/test/Makefile doc/Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile src/version.c src/getdns/getdns.h src/getdns/getdns_extra.h spec/example/Makefile src/test/Makefile doc/Makefile getdns.pc])
 if [ test -n "$DOXYGEN" ]
     then AC_CONFIG_FILES([src/Doxyfile])
 fi
@@ -917,6 +959,8 @@ if test $ac_cv_c_unused_attribute = yes; then
   AC_DEFINE(HAVE_ATTR_UNUSED, 1, [Whether the C compiler accepts the "unused" attribute])
 fi
 AC_CHECK_DECLS([strlcpy,arc4random,arc4random_uniform])
+AC_REPLACE_FUNCS(inet_pton)
+AC_REPLACE_FUNCS(inet_ntop)
 AC_REPLACE_FUNCS(strlcpy)
 AC_REPLACE_FUNCS(arc4random)
 AC_REPLACE_FUNCS(arc4random_uniform)
@@ -974,6 +1018,35 @@ esac
 AC_SUBST(C99COMPATFLAGS)
 
 AH_BOTTOM([
+
+/* the version of the windows API enabled */
+#undef WINVER
+#undef _WIN32_WINNT
+#define WINVER 0x0600 // 0x0502
+#define _WIN32_WINNT 0x0600 // 0x0502
+#ifdef HAVE_WINSOCK2_H
+#include <winsock2.h>
+#include<BaseTsd.h>
+#endif
+
+#ifdef HAVE_WS2TCPIP_H
+#include <ws2tcpip.h>
+#endif
+
+#ifndef USE_WINSOCK
+#define ARG_LL "%ll"
+#else
+#define ARG_LL "%I64"
+#endif
+
+/* detect if we need to cast to unsigned int for FD_SET to avoid warnings */
+#ifdef HAVE_WINSOCK2_H
+#define FD_SET_T (u_int)
+#else
+#define FD_SET_T 
+#endif
+
+
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -1030,6 +1103,14 @@ void SHA512_Final(uint8_t[SHA512_DIGEST_LENGTH], SHA512_CTX*);
 unsigned char *SHA512(void* data, unsigned int data_len, unsigned char *digest);
 #endif /* COMPAT_SHA512 */
 
+#ifndef HAVE_INET_PTON
+int inet_pton(int af, const char* src, void* dst);
+#endif /* HAVE_INET_PTON */
+
+#ifndef HAVE_INET_NTOP
+const char *inet_ntop(int af, const void *src, char *dst, size_t size);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
@@ -1082,13 +1163,6 @@ unsigned char *SHA512(void* data, unsigned int data_len, unsigned char *digest);
 #else /* !HAVE_ATTR_UNUSED */
 #  define ATTR_UNUSED(x)  x
 #endif /* !HAVE_ATTR_UNUSED */
-
-/* detect if we need to cast to unsigned int for FD_SET to avoid warnings */
-#ifdef HAVE_WINSOCK2_H
-#define FD_SET_T (u_int)
-#else
-#define FD_SET_T 
-#endif
 
 #ifdef TIME_WITH_SYS_TIME
 # include <sys/time.h>

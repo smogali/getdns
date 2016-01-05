@@ -31,27 +31,40 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "config.h"
+#include "debug.h"
 #include <openssl/err.h>
 #include <openssl/conf.h>
 #include <openssl/x509v3.h>
-#include "config.h"
 #include <fcntl.h>
 #include "stub.h"
 #include "gldns/gbuffer.h"
 #include "gldns/pkthdr.h"
 #include "gldns/rrdef.h"
 #include "gldns/str2wire.h"
+#include "gldns/wire2str.h"
 #include "rr-iter.h"
 #include "context.h"
 #include "util-internal.h"
 #include "general.h"
+#include "pubkey-pinning.h"
 
+#ifdef USE_WINSOCK
+#define EINPROGRESS 112
+#define EWOULDBLOCK 140
+typedef u_short sa_family_t;
+#include "util/winsock_event.h"
+#endif
+
+#define STUB_OUT_OF_OPTIONS -5 /* upstream options exceeded MAXIMUM_UPSTREAM_OPTION_SPACE */
 #define STUB_TLS_SETUP_ERROR -4
 #define STUB_TCP_AGAIN -3
 #define STUB_TCP_ERROR -2
 
 /* Don't currently have access to the context whilst doing handshake */
 #define TIMEOUT_TLS 2500
+/* Arbritray number of message for EDNS keepalive resend*/
+#define EDNS_KEEPALIVE_RESEND 5
 
 static time_t secret_rollover_time = 0;
 static uint32_t secret = 0;
@@ -73,7 +86,6 @@ static void netreq_upstream_read_cb(void *userarg);
 static void netreq_upstream_write_cb(void *userarg);
 static int  fallback_on_write(getdns_network_req *netreq);
 
-static void stub_tcp_write_cb(void *userarg);
 static void stub_timeout_cb(void *userarg);
 /*****************************/
 /* General utility functions */
@@ -129,9 +141,36 @@ calc_new_cookie(getdns_upstream *upstream, uint8_t *cookie)
                 cookie[i % 8] ^= md_value[i];
 }
 
-static uint8_t *
-attach_edns_cookie(getdns_upstream *upstream, uint8_t *opt)
+static getdns_return_t
+attach_edns_client_subnet_private(getdns_network_req *req)
 {
+	/* see
+	 * https://tools.ietf.org/html/draft-ietf-dnsop-edns-client-subnet-04#section-6 */
+	/* all-zeros is a request to not leak the data further: */
+	/* "\x00\x00"  FAMILY: 0 (because no address) */
+	/* "\x00"  SOURCE PREFIX-LENGTH: 0 */ 
+	/* "\x00";  SCOPE PREFIX-LENGTH: 0 */
+	return _getdns_network_req_add_upstream_option(req,
+						       GLDNS_EDNS_CLIENT_SUBNET,
+						       4, NULL);
+}
+
+static getdns_return_t
+attach_edns_keepalive(getdns_network_req *req)
+{
+    /* Client always sends length 0, omits the timeout */
+	return _getdns_network_req_add_upstream_option(req,
+						       GLDNS_EDNS_KEEPALIVE,
+						       0, NULL);
+}
+
+static getdns_return_t
+attach_edns_cookie(getdns_network_req *req)
+{
+	getdns_upstream *upstream = req->upstream;
+	uint16_t sz;
+	void* val;
+	uint8_t buf[8 + 32]; /* server cookies can be no larger than 32 bytes */
 	rollover_secret();
 
 	if (!upstream->has_client_cookie) {
@@ -139,12 +178,8 @@ attach_edns_cookie(getdns_upstream *upstream, uint8_t *opt)
 		upstream->secret = secret;
 		upstream->has_client_cookie = 1;
 
-		gldns_write_uint16(opt +  9, 12); /* rdata len */
-		gldns_write_uint16(opt + 11, EDNS_COOKIE_OPCODE);
-		gldns_write_uint16(opt + 13,  8); /* opt len */
-		memcpy(opt + 15, upstream->client_cookie, 8);
-		return opt + 23;
-
+		sz = 8;
+		val = upstream->client_cookie;
 	} else if (upstream->secret != secret) {
 		memcpy( upstream->prev_client_cookie
 		      , upstream->client_cookie, 8);
@@ -152,37 +187,28 @@ attach_edns_cookie(getdns_upstream *upstream, uint8_t *opt)
 		calc_new_cookie(upstream, upstream->client_cookie);
 		upstream->secret = secret;
 
-		gldns_write_uint16(opt +  9, 12); /* rdata len */
-		gldns_write_uint16(opt + 11, EDNS_COOKIE_OPCODE);
-		gldns_write_uint16(opt + 13,  8); /* opt len */
-		memcpy(opt + 15, upstream->client_cookie, 8);
-		return opt + 23;
-
+		sz = 8;
+		val = upstream->client_cookie;
 	} else if (!upstream->has_server_cookie) {
-		gldns_write_uint16(opt +  9, 12); /* rdata len */
-		gldns_write_uint16(opt + 11, EDNS_COOKIE_OPCODE);
-		gldns_write_uint16(opt + 13,  8); /* opt len */
-		memcpy(opt + 15, upstream->client_cookie, 8);
-		return opt + 23;
+		sz = 8;
+		val = upstream->client_cookie;
 	} else {
-		gldns_write_uint16( opt +  9, 12  /* rdata len */
-		                  + upstream->server_cookie_len);
-		gldns_write_uint16(opt + 11, EDNS_COOKIE_OPCODE);
-		gldns_write_uint16(opt + 13,  8   /* opt len */
-		                  + upstream->server_cookie_len);
-		memcpy(opt + 15, upstream->client_cookie, 8);
-		memcpy(opt + 23, upstream->server_cookie
-		               , upstream->server_cookie_len);
-		return opt + 23+ upstream->server_cookie_len;
+		sz = 8 + upstream->server_cookie_len;
+		memcpy(buf, upstream->client_cookie, 8);
+		memcpy(buf+8, upstream->server_cookie, upstream->server_cookie_len);
+		val = buf;
 	}
+	return _getdns_network_req_add_upstream_option(req, EDNS_COOKIE_OPCODE, sz, val);
+
 }
 
+/* Will find a matching OPT RR, but leaves the caller to validate it*/
 static int
-match_and_process_server_cookie(
-    getdns_upstream *upstream, uint8_t *response, size_t response_len)
+match_edns_opt_rr(uint16_t code, uint8_t *response, size_t response_len,
+                  const uint8_t **position, uint16_t *option_len)
 {
 	_getdns_rr_iter rr_iter_storage, *rr_iter;
-	uint8_t *pos;
+	const uint8_t *pos;
 	uint16_t rdata_len, opt_code = 0, opt_len = 0;
 
 	/* Search for the OPT RR (if any) */
@@ -205,7 +231,17 @@ match_and_process_server_cookie(
 
 	pos = rr_iter->rr_type + 8;
 
-	/* OPT found, now search for the cookie option */
+#if defined(STUB_DEBUG) && STUB_DEBUG
+	char str_spc[8192], *str = str_spc;
+	size_t str_len = sizeof(str_spc);
+	uint8_t *data = (uint8_t *)rr_iter->pos;
+	size_t data_len = rr_iter->nxt - rr_iter->pos;
+	(void) gldns_wire2str_rr_scan(
+	    &data, &data_len, &str, &str_len, (uint8_t *)rr_iter->pkt, rr_iter->pkt_end - rr_iter->pkt);
+	DEBUG_STUB("OPT RR: %s", str_spc);
+#endif
+
+	/* OPT found, now search for the specified option */
 	if (pos + 2 > rr_iter->nxt)
 		return 1; /* FORMERR */
 
@@ -218,23 +254,39 @@ match_and_process_server_cookie(
 		opt_len  = gldns_read_uint16(pos); pos += 2;
 		if (pos + opt_len > rr_iter->nxt)
 			return 1; /* FORMERR */
-		if (opt_code == EDNS_COOKIE_OPCODE)
+		if (opt_code == code)
 			break;
 		pos += opt_len; /* Skip unknown options */
 	}
-	if (pos >= rr_iter->nxt || opt_code != EDNS_COOKIE_OPCODE)
+	if (pos >= rr_iter->nxt || opt_code != code)
 		return 0; /* Everything OK, just no cookie found. */
+	*position = pos;
+	*option_len = opt_len;
+	return 2;
+}
 
-	if (opt_len < 16 || opt_len > 40)
+/* TODO: Test combinations of EDNS0 options*/
+static int
+match_and_process_server_cookie(
+    getdns_upstream *upstream, uint8_t *response, size_t response_len) 
+{
+	const uint8_t *position = NULL;
+	uint16_t option_len = 0;
+	int found = match_edns_opt_rr(EDNS_COOKIE_OPCODE, response, 
+	                              response_len, &position, &option_len);
+	if (found != 2)
+		return found;
+
+	if (option_len < 16 || option_len > 40)
 		return 1; /* FORMERR */
 
 	if (!upstream->has_client_cookie)
 		return 1; /* Cookie reply, but we didn't sent one */
 
-	if (memcmp(upstream->client_cookie, pos, 8) != 0) {
+	if (memcmp(upstream->client_cookie, position, 8) != 0) {
 		if (!upstream->has_prev_client_cookie)
 			return 1; /* Cookie didn't match */
-		if (memcmp(upstream->prev_client_cookie, pos, 8) != 0)
+		if (memcmp(upstream->prev_client_cookie, position, 8) != 0)
 			return 1; /* Previous cookie didn't match either */
 
 		upstream->has_server_cookie = 0;
@@ -242,85 +294,41 @@ match_and_process_server_cookie(
 		           * is for our previous client cookie
 			   */
 	}
-	pos += 8;
-	opt_len -= 8;
+	position += 8;
+	option_len -= 8;
 	upstream->has_server_cookie = 1;
-	upstream->server_cookie_len = opt_len;
-	(void) memcpy(upstream->server_cookie, pos, opt_len);
+	upstream->server_cookie_len = option_len;
+	(void) memcpy(upstream->server_cookie, position, option_len);
 	return 0;
 }
 
 static int
-create_starttls_request(getdns_dns_req *dnsreq, getdns_upstream *upstream,
-                        getdns_eventloop *loop)
+process_keepalive(
+    getdns_upstream *upstream, getdns_network_req *netreq, 
+    uint8_t *response, size_t response_len) 
 {
-	getdns_return_t r = GETDNS_RETURN_GOOD;
-	getdns_dict* extensions = getdns_dict_create_with_context(dnsreq->context);
-	if (!extensions) {
-	    return 0;
+	const uint8_t *position = NULL;
+	uint16_t option_len = 0;
+	int found = match_edns_opt_rr(GLDNS_EDNS_KEEPALIVE, response, 
+	                              response_len, &position, &option_len);
+	if (found != 2) {
+		if (netreq->keepalive_sent == 1)
+			/* If no keepalive sent back, then we must use 0 idle timeout
+			   as server does not support it.*/
+			upstream->keepalive_timeout = 0;
+		return found;
 	}
-	r = getdns_dict_set_int(extensions, "specify_class", GLDNS_RR_CLASS_CH);
-	if (r != GETDNS_RETURN_GOOD) {
-	    getdns_dict_destroy(extensions);
-		return 0;
-	}
-	upstream->starttls_req = _getdns_dns_req_new(dnsreq->context, loop,
-	    "STARTTLS", GETDNS_RRTYPE_TXT, extensions);
-	/*TODO[TLS]: TO BIT*/
-	if (upstream->starttls_req == NULL)
-		return 0;
-	getdns_dict_destroy(extensions);
-
-	upstream->starttls_req->netreqs[0]->upstream = upstream;
-	return 1;
-}
-
-static int
-is_starttls_response(getdns_network_req *netreq) 
-{
-	_getdns_rr_iter rr_iter_storage, *rr_iter;
-	_getdns_rdf_iter rdf_iter_storage, *rdf_iter;
-	uint16_t rr_type;
-	gldns_pkt_section section;
-	uint8_t starttls_name_space[256], *starttls_name;
-	uint8_t owner_name_space[256], *owner_name;
-	size_t starttls_name_len = sizeof(starttls_name_space);
-	size_t owner_name_len = sizeof(owner_name_space);;
-
-	/* Servers that are not STARTTLS aware will refuse the CH query*/
-	if (GLDNS_RCODE_NOERROR != GLDNS_RCODE_WIRE(netreq->response))
-		return 0;
-
-	if (GLDNS_ANCOUNT(netreq->response) != 1)
-		return 0;
-
-	for ( rr_iter = _getdns_rr_iter_init(&rr_iter_storage
-	                                        , netreq->response
-	                                        , netreq->response_len)
-	    ; rr_iter
-	    ; rr_iter = _getdns_rr_iter_next(rr_iter)) {
-
-		section = _getdns_rr_iter_section(rr_iter);
-		rr_type = gldns_read_uint16(rr_iter->rr_type);
-		if (section != GLDNS_SECTION_ANSWER
-		    || rr_type != GETDNS_RRTYPE_TXT)
-			continue;
-
-		owner_name = _getdns_owner_if_or_as_decompressed(
-		    rr_iter, owner_name_space, &owner_name_len);
-		if (!_getdns_dname_equal(netreq->owner->name, owner_name))
-			continue;
-
-		if (!(rdf_iter = _getdns_rdf_iter_init(
-		     &rdf_iter_storage, rr_iter)))
-			continue;
-
-		if ((starttls_name = _getdns_rdf_if_or_as_decompressed(
-		    rdf_iter, starttls_name_space, &starttls_name_len)) &&
-		    _getdns_dname_equal(starttls_name, owner_name)) 
-			return 1;
-
-		return 0;
+	if (option_len != 2)
+		return 1; /* FORMERR */
+	/* Use server sent value unless the client specified a shorter one.
+	   Convert to ms first (wire value has units of 100ms) */
+	uint64_t server_keepalive = ((uint64_t)gldns_read_uint16(position))*100;
+	if (netreq->owner->context->idle_timeout < server_keepalive)
+		upstream->keepalive_timeout = netreq->owner->context->idle_timeout;
+	else {
+		upstream->keepalive_timeout = server_keepalive;
+		DEBUG_STUB("*** %s: SERVER KEEPALIVE USED : %d ms\n",
+			__FUNCTION__, (int)server_keepalive);
 	}
 	return 0;
 }
@@ -355,9 +363,24 @@ tcp_connect(getdns_upstream *upstream, getdns_transport_list_t transport)
 	getdns_sock_nonblock(fd);
 #ifdef USE_TCP_FASTOPEN
 	/* Leave the connect to the later call to sendto() if using TCP*/
-	if (transport == GETDNS_TRANSPORT_TCP || 
-	    transport == GETDNS_TRANSPORT_STARTTLS)
+	if (transport == GETDNS_TRANSPORT_TCP)
 		return fd;
+#elif USE_OSX_TCP_FASTOPEN
+	sa_endpoints_t endpoints;
+	endpoints.sae_srcif = 0;
+	endpoints.sae_srcaddr = NULL;
+	endpoints.sae_srcaddrlen = 0;
+	endpoints.sae_dstaddr = (struct sockaddr *)&upstream->addr;
+	endpoints.sae_dstaddrlen = upstream->addr_len;
+	if (connectx(fd, &endpoints, SAE_ASSOCID_ANY,  
+	             CONNECT_DATA_IDEMPOTENT | CONNECT_RESUME_ON_READ_WRITE,
+	             NULL, 0, NULL, NULL) == -1) {
+		if (errno != EINPROGRESS) {
+			close(fd);
+			return -1;
+		}
+	}
+	return fd;
 #endif
 	if (connect(fd, (struct sockaddr *)&upstream->addr,
 	    upstream->addr_len) == -1) {
@@ -444,7 +467,7 @@ stub_cleanup(getdns_network_req *netreq)
 			netreq->write_queue_tail = NULL;
 			break;
 		}
-	upstream_reschedule_events(upstream, netreq->owner->context->idle_timeout);
+	upstream_reschedule_events(upstream, upstream->keepalive_timeout);
 }
 
 static int
@@ -462,14 +485,13 @@ tls_cleanup(getdns_upstream *upstream)
 	     NULL, upstream_write_cb, NULL));
 	/* Reset sync event, with full timeout (which isn't correct)*/
 	getdns_network_req *netreq = upstream->write_queue;
-	if (netreq && (netreq->event.write_cb || netreq->event.read_cb)) {
+	if (netreq) {
 		GETDNS_CLEAR_EVENT(netreq->owner->loop, &netreq->event);
 		GETDNS_SCHEDULE_EVENT(
 		    netreq->owner->loop, upstream->fd, netreq->owner->context->timeout,
-		    getdns_eventloop_event_init(
-		    &netreq->event, netreq,
-		    NULL, netreq_upstream_write_cb,
-		    stub_timeout_cb));
+		    getdns_eventloop_event_init(&netreq->event, netreq, NULL,
+		    ( netreq->owner->loop != netreq->upstream->loop /* Synchronous lookup? */
+		    ? netreq_upstream_write_cb : NULL), stub_timeout_cb));
 	}
 	return STUB_TLS_SETUP_ERROR;
 }
@@ -501,33 +523,23 @@ _getdns_cancel_stub_request(getdns_network_req *netreq)
 	if (netreq->fd >= 0) close(netreq->fd);
 }
 
-static void
+/* May be needed in future for better UDP error handling?*/
+/*static void
 stub_erred(getdns_network_req *netreq)
 {
 	DEBUG_STUB("*** %s\n", __FUNCTION__);
 	stub_next_upstream(netreq);
 	stub_cleanup(netreq);
-	/* TODO[TLS]: When we get an error (which is probably a timeout) and are 
-	 * using to keep connections open should we leave the connection up here? */
 	if (netreq->fd >= 0) close(netreq->fd);
 	netreq->state = NET_REQ_FINISHED;
 	_getdns_check_dns_req_complete(netreq->owner);
-}
+}*/
 
 static void
 stub_timeout_cb(void *userarg)
 {
 	DEBUG_STUB("*** %s(%p)\n", __FUNCTION__, userarg);
 	getdns_network_req *netreq = (getdns_network_req *)userarg;
-	
-	/* For now, mark a STARTTLS timeout as a failured negotiation and allow 
-	 * fallback but don't close the connection. */
-	if (netreq->owner == netreq->upstream->starttls_req) {
-		netreq->upstream->tls_hs_state = GETDNS_HS_FAILED;
-		stub_next_upstream(netreq);
-		stub_cleanup(netreq);
-		return;
-	}
 
 	stub_next_upstream(netreq);
 	stub_cleanup(netreq);
@@ -613,7 +625,7 @@ stub_tls_timeout_cb(void *userarg)
 /****************************/
 
 static int
-stub_tcp_read(int fd, getdns_tcp_state *tcp, struct mem_funcs *mf)
+stub_tcp_read(int fd, getdns_tcp_state *tcp, struct mem_funcs *mf, getdns_eventloop_event* event)
 {
 	ssize_t  read;
 	uint8_t *buf;
@@ -628,12 +640,26 @@ stub_tcp_read(int fd, getdns_tcp_state *tcp, struct mem_funcs *mf)
 		tcp->read_pos = tcp->read_buf;
 		tcp->to_read = 2; /* Packet size */
 	}
-	read = recv(fd, tcp->read_pos, tcp->to_read, 0);
+	read = recv(fd, (void *)tcp->read_pos, tcp->to_read, 0);
 	if (read == -1) {
+#ifdef USE_WINSOCK 
+	printf("read (in tcp ) %s\n",
+			wsa_strerror(WSAGetLastError()));
+	if (WSAGetLastError() == WSAECONNRESET)
+		return STUB_TCP_AGAIN;
+	if (WSAGetLastError() == WSAEINPROGRESS)
+	    return STUB_TCP_AGAIN;
+	if (WSAGetLastError() == WSAEWOULDBLOCK) {
+		winsock_tcp_wouldblock(event->ev, EV_READ);
+		return STUB_TCP_AGAIN;
+	}
+
+#else
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			return STUB_TCP_AGAIN;
 		else
 			return STUB_TCP_ERROR;
+#endif
 	} else if (read == 0) {
 		/* Remote end closed the socket */
 		/* TODO: Try to reconnect */
@@ -681,7 +707,7 @@ static int
 stub_tcp_write(int fd, getdns_tcp_state *tcp, getdns_network_req *netreq)
 {
 
-	size_t          pkt_len = netreq->response - netreq->query;
+	size_t          pkt_len;
 	ssize_t         written;
 	uint16_t        query_id;
 	intptr_t        query_id_intptr;
@@ -690,6 +716,7 @@ stub_tcp_write(int fd, getdns_tcp_state *tcp, getdns_network_req *netreq)
 	if (q != 0)
 		return q;
 
+	netreq->debug_udp = 0;
 	/* Do we have remaining data that we could not write before?  */
 	if (! tcp->write_buf) {
 		/* No, this is an initial write. Try to send
@@ -704,16 +731,26 @@ stub_tcp_write(int fd, getdns_tcp_state *tcp, getdns_network_req *netreq)
 
 		GLDNS_ID_SET(netreq->query, query_id);
 		if (netreq->opt) {
+			_getdns_network_req_clear_upstream_options(netreq);
 			/* no limits on the max udp payload size with tcp */
 			gldns_write_uint16(netreq->opt + 3, 65535);
 
-			if (netreq->owner->edns_cookies) {
-				netreq->response = attach_edns_cookie(
-				    netreq->upstream, netreq->opt);
-				pkt_len = netreq->response - netreq->query;
-				gldns_write_uint16(netreq->query - 2, pkt_len);
+			if (netreq->owner->edns_cookies)
+				if (attach_edns_cookie(netreq))
+					return STUB_OUT_OF_OPTIONS;
+			if (netreq->owner->edns_client_subnet_private)
+				if (attach_edns_client_subnet_private(netreq))
+					return STUB_OUT_OF_OPTIONS;
+			if (netreq->upstream->writes_done == 0 && 
+				netreq->owner->context->idle_timeout != 0) {
+				/* Add the keepalive option to the first query on this connection*/
+				DEBUG_STUB("# %s: Requesting keepalive\n", __FUNCTION__);
+				if (attach_edns_keepalive(netreq))
+					return STUB_OUT_OF_OPTIONS;
+				netreq->keepalive_sent = 1;
 			}
 		}
+		pkt_len = _getdns_network_req_add_tsig(netreq);
 		/* We have an initialized packet buffer.
 		 * Lets see how much of it we can write
 		 */
@@ -735,7 +772,16 @@ stub_tcp_write(int fd, getdns_tcp_state *tcp, getdns_network_req *netreq)
 		                       errno == EINPROGRESS)) ||
 		     written  < pkt_len + 2) {
 #else
+
+#ifdef USE_WINSOCK
+		written = sendto(fd, (const char *)(netreq->query - 2),
+		    pkt_len + 2, 0,
+		    (struct sockaddr *)&(netreq->upstream->addr),
+		    netreq->upstream->addr_len);
+
+#else
 		written = write(fd, netreq->query - 2, pkt_len + 2);
+#endif
 		if ((written == -1 && (errno == EAGAIN ||
 		                       errno == EWOULDBLOCK)) ||
 		     written  < pkt_len + 2) {
@@ -789,27 +835,22 @@ static int
 tls_requested(getdns_network_req *netreq)
 {
 	return (netreq->transports[netreq->transport_current] ==
-	        GETDNS_TRANSPORT_TLS ||
-	        netreq->transports[netreq->transport_current] ==
-	        GETDNS_TRANSPORT_STARTTLS) ?
+	        GETDNS_TRANSPORT_TLS) ?
 	        1 : 0;
 }
 
 static int
 tls_should_write(getdns_upstream *upstream)
 {
-	/* Should messages be written on TLS upstream. Remember that for STARTTLS
-	 * the first message should got over TCP as the handshake isn't started yet.*/
-	return ((upstream->transport == GETDNS_TRANSPORT_TLS ||
-	         upstream->transport == GETDNS_TRANSPORT_STARTTLS) &&
+	/* Should messages be written on TLS upstream. */
+	return ((upstream->transport == GETDNS_TRANSPORT_TLS) &&
 	         upstream->tls_hs_state != GETDNS_HS_NONE) ? 1 : 0;
 }
 
 static int
 tls_should_read(getdns_upstream *upstream)
 {
-	return ((upstream->transport == GETDNS_TRANSPORT_TLS ||
-	         upstream->transport == GETDNS_TRANSPORT_STARTTLS) &&
+	return ((upstream->transport == GETDNS_TRANSPORT_TLS) &&
 	       !(upstream->tls_hs_state == GETDNS_HS_FAILED ||
 	         upstream->tls_hs_state == GETDNS_HS_NONE)) ? 1 : 0;
 }
@@ -818,54 +859,48 @@ static int
 tls_failed(getdns_upstream *upstream)
 {
 	/* No messages should be scheduled onto an upstream in this state */
-	return ((upstream->transport == GETDNS_TRANSPORT_TLS ||
-	         upstream->transport == GETDNS_TRANSPORT_STARTTLS) &&
+	return ((upstream->transport == GETDNS_TRANSPORT_TLS) &&
 	         upstream->tls_hs_state == GETDNS_HS_FAILED) ? 1 : 0;
 }
 
 static int
 tls_auth_status_ok(getdns_upstream *upstream, getdns_network_req *netreq) {
-	return (netreq->tls_auth_min == GETDNS_AUTHENTICATION_HOSTNAME &&
+	return (netreq->tls_auth_min == GETDNS_AUTHENTICATION_REQUIRED &&
 		    upstream->tls_auth_failed) ? 0 : 1;
 }
 
 int
 tls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
 {
-#if defined(STUB_DEBUG) && STUB_DEBUG
-	int     err;
-	const char * err_str;
+	getdns_upstream *upstream;
+	getdns_return_t pinset_ret = GETDNS_RETURN_GOOD;
 
-	err = X509_STORE_CTX_get_error(ctx);
-	err_str = X509_verify_cert_error_string(err);
-	DEBUG_STUB("--- %s, VERIFY RESULT: %s\n", __FUNCTION__, err_str);
+#if defined(STUB_DEBUG) && STUB_DEBUG || defined(X509_V_ERR_HOSTNAME_MISMATCH)
+	int     err = X509_STORE_CTX_get_error(ctx);
+
+	DEBUG_STUB("--- %s, VERIFY RESULT: (%d) \"%s\"\n", __FUNCTION__,
+		   err, X509_verify_cert_error_string(err));
 #endif
-	/*Always proceed without changing result*/
-	return preverify_ok;
-}
+	upstream = _getdns_upstream_from_x509_store(ctx);
 
-int
-tls_verify_callback_with_fallback(int preverify_ok, X509_STORE_CTX *ctx)
-{
 #ifdef X509_V_ERR_HOSTNAME_MISMATCH
-	int     err;
-# if defined(STUB_DEBUG) && STUB_DEBUG
-	const char * err_str;
-# endif
-	
-	err = X509_STORE_CTX_get_error(ctx);
-# if defined(STUB_DEBUG) && STUB_DEBUG
-	err_str = X509_verify_cert_error_string(err);
-	DEBUG_STUB("--- %s, VERIFY RESULT: (%d) \"%s\"\n", __FUNCTION__, err, err_str);
-# endif
-	/*Proceed if error is hostname mismatch*/
-	if (err == X509_V_ERR_HOSTNAME_MISMATCH) {
-		DEBUG_STUB("--- %s, PROCEEDING WITHOUT HOSTNAME VALIDATION!!\n", __FUNCTION__);
-		return 1;
-	}
-	else
+	/*Report if error is hostname mismatch*/
+	if (upstream && upstream->tls_fallback_ok && err == X509_V_ERR_HOSTNAME_MISMATCH)
+		DEBUG_STUB("--- %s, PROCEEDING EVEN THOUGH HOSTNAME VALIDATION FAILED!!\n", __FUNCTION__);
 #endif
-		return preverify_ok;
+	if (upstream && upstream->tls_pubkey_pinset)
+		pinset_ret = _getdns_verify_pinset_match(upstream->tls_pubkey_pinset, ctx);
+
+	if (pinset_ret != GETDNS_RETURN_GOOD) {
+		DEBUG_STUB("--- %s, PINSET VALIDATION FAILURE!!\n", __FUNCTION__);
+		preverify_ok = 0;
+		upstream->tls_auth_failed = 1;
+		if (upstream->tls_fallback_ok)
+			DEBUG_STUB("--- %s, PROCEEDING EVEN THOUGH PINSET VALIDATION FAILED!!\n", __FUNCTION__);
+	}
+	/* If fallback is allowed, proceed regardless of what the auth error is
+	   (might not be hostname or pinset related) */
+	return (upstream && upstream->tls_fallback_ok) ? 1 : preverify_ok;
 }
 
 static SSL*
@@ -883,14 +918,22 @@ tls_create_object(getdns_dns_req *dnsreq, int fd, getdns_upstream *upstream)
 		SSL_free(ssl);
 		return NULL;
 	}
+	/* make sure we'll be able to find the context again when we need it */
+	if (_getdns_associate_upstream_with_SSL(ssl, upstream) != GETDNS_RETURN_GOOD) {
+		SSL_free(ssl);
+		return NULL;
+	}
 
 	/* NOTE: this code will fallback on a given upstream, without trying
 	   authentication on other upstreams first. This is non-optimal and but avoids
 	   multiple TLS handshakes before getting a usable connection. */
 
+	upstream->tls_fallback_ok = 0;
 	/* If we have a hostname, always use it */
 	if (upstream->tls_auth_name[0] != '\0') {
 		/*Request certificate for the auth_name*/
+		DEBUG_STUB("--- %s, HOSTNAME VERIFICATION REQUESTED for: %s\n"
+		          , __FUNCTION__, upstream->tls_auth_name);
 		SSL_set_tlsext_host_name(ssl, upstream->tls_auth_name);
 #ifdef HAVE_SSL_HN_AUTH
 		/* Set up native OpenSSL hostname verification*/
@@ -898,38 +941,44 @@ tls_create_object(getdns_dns_req *dnsreq, int fd, getdns_upstream *upstream)
 		param = SSL_get0_param(ssl);
 		X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
 		X509_VERIFY_PARAM_set1_host(param, upstream->tls_auth_name, 0);
-		DEBUG_STUB("--- %s, HOSTNAME VERIFICATION REQUESTED \n", __FUNCTION__);
 #else
-		if (dnsreq->netreqs[0]->tls_auth_min == GETDNS_AUTHENTICATION_HOSTNAME) {
+		if (dnsreq->netreqs[0]->tls_auth_min == GETDNS_AUTHENTICATION_REQUIRED) {
 			/* TODO: Trigger post-handshake custom validation*/
-			DEBUG_STUB("--- %s, ERROR: Authentication functionality not available\n", __FUNCTION__);
+			DEBUG_STUB("--- %s, ERROR: TLS Authentication functionality not available\n", __FUNCTION__);
 			upstream->tls_hs_state = GETDNS_HS_FAILED;
 			upstream->tls_auth_failed = 1;
 			return NULL;
 		}
 #endif
-		/* Allow fallback to oppotunisitc if settings permit it*/
-		if (dnsreq->netreqs[0]->tls_auth_min == GETDNS_AUTHENTICATION_HOSTNAME)
-			SSL_set_verify(ssl, SSL_VERIFY_PEER, tls_verify_callback);
-		else {
-			SSL_set_verify(ssl, SSL_VERIFY_NONE, tls_verify_callback_with_fallback);
-			SSL_set_cipher_list(ssl, "DEFAULT");
-		}
+		/* Allow fallback to opportunistic if settings permit it*/
+		if (dnsreq->netreqs[0]->tls_auth_min != GETDNS_AUTHENTICATION_REQUIRED)
+			upstream->tls_fallback_ok = 1;
 	} else {
-		/* Lack of host name is OK unless only authenticated TLS is specified*/
-		if (dnsreq->netreqs[0]->tls_auth_min == GETDNS_AUTHENTICATION_HOSTNAME) {
-			DEBUG_STUB("--- %s, ERROR: No host name provided for authentication\n", __FUNCTION__);
-			upstream->tls_hs_state = GETDNS_HS_FAILED;
-			upstream->tls_auth_failed = 1;
-			return NULL;
+		/* Lack of host name is OK unless only authenticated
+		 * TLS is specified and we have no pubkey_pinset */
+		if (dnsreq->netreqs[0]->tls_auth_min == GETDNS_AUTHENTICATION_REQUIRED) {
+			if (upstream->tls_pubkey_pinset) {
+				DEBUG_STUB("--- %s, PROCEEDING WITH ONLY PUBKEY PINNING AUTHENTICATION\n", __FUNCTION__);
+			} else {
+				DEBUG_STUB("--- %s, ERROR: No host name or pubkey pinset provided for TLS authentication\n", __FUNCTION__);
+				upstream->tls_hs_state = GETDNS_HS_FAILED;
+				upstream->tls_auth_failed = 1;
+				return NULL;
+			}
 		} else {
-			DEBUG_STUB("--- %s, PROCEEDING WITHOUT HOSTNAME VALIDATION!!\n", __FUNCTION__);
+			/* no hostname verification, so we will make opportunistic connections */
+			DEBUG_STUB("--- %s, PROCEEDING EVEN THOUGH NO HOSTNAME PROVIDED!!\n", __FUNCTION__);
 			upstream->tls_auth_failed = 1;
-			SSL_set_verify(ssl, SSL_VERIFY_NONE, tls_verify_callback_with_fallback);
-			SSL_set_cipher_list(ssl, "DEFAULT");
+			upstream->tls_fallback_ok = 1;
 		}
 	}
-	
+	if (upstream->tls_fallback_ok) {
+		SSL_set_cipher_list(ssl, "DEFAULT");
+		DEBUG_STUB("--- %s, PROCEEDING WITH OPPOTUNISTIC TLS CONNECTION (FALLBACK ALLOWED)!!\n", __FUNCTION__);
+	} else
+		DEBUG_STUB("--- %s, PROCEEDING WITH STRICT TLS CONNECTION!!\n", __FUNCTION__);
+	SSL_set_verify(ssl, SSL_VERIFY_PEER, tls_verify_callback);
+
 	SSL_set_connect_state(ssl);
 	(void) SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
 	return ssl;
@@ -990,10 +1039,15 @@ tls_do_handshake(getdns_upstream *upstream)
 	}
 	upstream->tls_hs_state = GETDNS_HS_DONE;
 	r = SSL_get_verify_result(upstream->tls_obj);
+	if (upstream->tls_auth_name[0])
 #ifdef X509_V_ERR_HOSTNAME_MISMATCH
-	if (r == X509_V_ERR_HOSTNAME_MISMATCH)
+		if (r == X509_V_ERR_HOSTNAME_MISMATCH)
+#else
+ /* if we weren't built against OpenSSL with hostname matching we
+  * could not have matched the hostname, so this would be an automatic
+  * tls_auth_fail. */
 #endif
-		upstream->tls_auth_failed = 1;
+			upstream->tls_auth_failed = 1;
 	/* Reset timeout on success*/
 	GETDNS_CLEAR_EVENT(upstream->loop, &upstream->event);
 	upstream->event.read_cb = NULL;
@@ -1001,6 +1055,12 @@ tls_do_handshake(getdns_upstream *upstream)
 	GETDNS_SCHEDULE_EVENT(upstream->loop, upstream->fd, TIMEOUT_FOREVER,
 	    getdns_eventloop_event_init(&upstream->event, upstream,
 	     NULL, upstream_write_cb, NULL));
+	GETDNS_CLEAR_EVENT(netreq->owner->loop, &netreq->event);
+	GETDNS_SCHEDULE_EVENT(
+	    netreq->owner->loop, upstream->fd, netreq->owner->context->timeout,
+	    getdns_eventloop_event_init(&netreq->event, netreq, NULL,
+	    ( netreq->owner->loop != netreq->upstream->loop /* Synchronous lookup? */
+	    ? netreq_upstream_write_cb : NULL), stub_timeout_cb));
 	/* Reschedule for synchronous */
 	/* TODO[TLS]: Re-instating full context->timeout here is wrong, as time has 
 	   passes since the netreq was originally scheduled, but we only hove one
@@ -1125,11 +1185,12 @@ static int
 stub_tls_write(getdns_upstream *upstream, getdns_tcp_state *tcp,
                getdns_network_req *netreq)
 {
-	size_t          pkt_len = netreq->response - netreq->query;
+	size_t          pkt_len;
 	ssize_t         written;
 	uint16_t        query_id;
 	intptr_t        query_id_intptr;
 	SSL* tls_obj = upstream->tls_obj;
+	uint16_t        padding_sz;
 
 	int q = tls_connected(upstream);
 	if (q != 0)
@@ -1155,10 +1216,40 @@ stub_tls_write(getdns_upstream *upstream, getdns_tcp_state *tcp,
 		    &netreq->upstream->netreq_by_query_id, &netreq->node));
 
 		GLDNS_ID_SET(netreq->query, query_id);
-		if (netreq->opt)
+		/* TODO: Review if more EDNS0 handling can be centralised.*/
+		if (netreq->opt) {
+			_getdns_network_req_clear_upstream_options(netreq);
 			/* no limits on the max udp payload size with tcp */
 			gldns_write_uint16(netreq->opt + 3, 65535);
+			/* we do not edns_cookie over TLS, since TLS
+			 * provides stronger guarantees than cookies
+			 * already */
+			if (netreq->owner->edns_client_subnet_private)
+				if (attach_edns_client_subnet_private(netreq))
+					return STUB_OUT_OF_OPTIONS;
+			if (netreq->upstream->writes_done % EDNS_KEEPALIVE_RESEND == 0 && 
+				netreq->owner->context->idle_timeout != 0) {
+				/* Add the keepalive option to every nth query on this 
+				   connection */
+				DEBUG_STUB("# %s: Requesting keepalive\n", __FUNCTION__);
+				if (attach_edns_keepalive(netreq))
+					return STUB_OUT_OF_OPTIONS;
+				netreq->keepalive_sent = 1;
+			}
+			if (netreq->owner->tls_query_padding_blocksize > 1) {
+				pkt_len = netreq->response - netreq->query;
+				pkt_len += 4; /* this accounts for the OPTION-CODE and OPTION-LENGTH of the padding */
+				padding_sz = pkt_len % netreq->owner->tls_query_padding_blocksize;
+				if (padding_sz)
+					padding_sz = netreq->owner->tls_query_padding_blocksize - padding_sz;
+				if (_getdns_network_req_add_upstream_option(netreq,
+									    EDNS_PADDING_OPCODE,
+									    padding_sz, NULL))
+					return STUB_OUT_OF_OPTIONS;
+			}
+		}
 
+		pkt_len = _getdns_network_req_add_tsig(netreq);
 		/* We have an initialized packet buffer.
 		 * Lets see how much of it we can write */
 		
@@ -1174,6 +1265,19 @@ stub_tls_write(getdns_upstream *upstream, getdns_tcp_state *tcp,
 	} 
 
 	return STUB_TCP_ERROR;
+}
+
+static uint64_t
+_getdns_get_time_as_uintt64() {
+	
+	struct timeval tv;
+	uint64_t       now;
+	
+	if (gettimeofday(&tv, NULL)) {
+		return 0;
+	}
+	now = tv.tv_sec * 1000000 + tv.tv_usec;
+	return now;
 }
 
 /**************************/
@@ -1192,7 +1296,7 @@ stub_udp_read_cb(void *userarg)
 
 	GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
 
-	read = recvfrom(netreq->fd, netreq->response,
+	read = recvfrom(netreq->fd, (void *)netreq->response,
 	    netreq->max_udp_payload_size + 1, /* If read == max_udp_payload_size
 	                                       * then all is good.  If read ==
 	                                       * max_udp_payload_size + 1, then
@@ -1214,17 +1318,19 @@ stub_udp_read_cb(void *userarg)
 		return; /* Client cookie didn't match? */
 
 	close(netreq->fd);
-	if (GLDNS_TC_WIRE(netreq->response)) {
+	while (GLDNS_TC_WIRE(netreq->response)) {
+		DEBUG_STUB("TC bit set\n");
 		if (!(netreq->transport_current < netreq->transport_count))
-			goto done;
+			break;
 		getdns_transport_list_t next_transport = 
 		                      netreq->transports[++netreq->transport_current];
-		if (next_transport != GETDNS_TRANSPORT_TCP)
-			goto done;
+		if (next_transport != GETDNS_TRANSPORT_TCP &&
+		    next_transport != GETDNS_TRANSPORT_TLS)
+			break;
 		/* For now, special case where fallback should be on the same upstream*/
 		if ((netreq->fd = upstream_connect(upstream, next_transport,
 		                                   dnsreq)) == -1)
-			goto done;
+			break;
 		upstream_schedule_netreq(netreq->upstream, netreq);
 		GETDNS_SCHEDULE_EVENT(
 		    dnsreq->loop, netreq->upstream->fd, dnsreq->context->timeout,
@@ -1236,7 +1342,7 @@ stub_udp_read_cb(void *userarg)
 	}
 	netreq->response_len = read;
 	dnsreq->upstreams->current = 0;
-done:
+	netreq->debug_end_time = _getdns_get_time_as_uintt64();
 	netreq->state = NET_REQ_FINISHED;
 	_getdns_check_dns_req_complete(dnsreq);
 }
@@ -1247,26 +1353,31 @@ stub_udp_write_cb(void *userarg)
 	DEBUG_STUB("%s\n", __FUNCTION__);
 	getdns_network_req *netreq = (getdns_network_req *)userarg;
 	getdns_dns_req     *dnsreq = netreq->owner;
-	size_t             pkt_len = netreq->response - netreq->query;
+	size_t             pkt_len;
 
 	GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
 
+	netreq->debug_start_time = _getdns_get_time_as_uintt64();
+	netreq->debug_udp = 1;
 	netreq->query_id = arc4random();
 	GLDNS_ID_SET(netreq->query, netreq->query_id);
 	if (netreq->opt) {
+		_getdns_network_req_clear_upstream_options(netreq);
 		if (netreq->edns_maximum_udp_payload_size == -1)
 			gldns_write_uint16(netreq->opt + 3,
 			    ( netreq->max_udp_payload_size =
 			      netreq->upstream->addr.ss_family == AF_INET6
 			    ? 1232 : 1432));
-		if (netreq->owner->edns_cookies) {
-			netreq->response = attach_edns_cookie(
-			    netreq->upstream, netreq->opt);
-			pkt_len = netreq->response - netreq->query;
-		}
+		if (netreq->owner->edns_cookies)
+			if (attach_edns_cookie(netreq))
+				return; /* too many upstream options */
+		if (netreq->owner->edns_client_subnet_private)
+			if (attach_edns_client_subnet_private(netreq))
+				return; /* too many upstream options */
 	}
-
-	if ((ssize_t)pkt_len != sendto(netreq->fd, netreq->query, pkt_len, 0,
+	pkt_len = _getdns_network_req_add_tsig(netreq);
+	if ((ssize_t)pkt_len != sendto(
+	    netreq->fd, (const void *)netreq->query, pkt_len, 0,
 	    (struct sockaddr *)&netreq->upstream->addr,
 	                        netreq->upstream->addr_len)) {
 		close(netreq->fd);
@@ -1279,75 +1390,6 @@ stub_udp_write_cb(void *userarg)
 }
 
 /**************************/
-/* TCP callback functions*/
-/**************************/
-
-static void
-stub_tcp_read_cb(void *userarg)
-{
-	getdns_network_req *netreq = (getdns_network_req *)userarg;
-	getdns_dns_req *dnsreq = netreq->owner;
-	int q;
-
-	switch ((q = stub_tcp_read(netreq->fd, &netreq->tcp,
-	                          &dnsreq->context->mf))) {
-
-	case STUB_TCP_AGAIN:
-		return;
-
-	case STUB_TCP_ERROR:
-		stub_erred(netreq);
-		return;
-
-	default:
-		GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
-		if (q != netreq->query_id)
-			return;
-		if (netreq->owner->edns_cookies &&
-		    match_and_process_server_cookie(
-		    netreq->upstream, netreq->tcp.read_buf,
-		    netreq->tcp.read_pos - netreq->tcp.read_buf))
-			return; /* Client cookie didn't match? */
-		netreq->state = NET_REQ_FINISHED;
-		netreq->response = netreq->tcp.read_buf;
-		netreq->response_len =
-		    netreq->tcp.read_pos - netreq->tcp.read_buf;
-		netreq->tcp.read_buf = NULL;
-		dnsreq->upstreams->current = 0;
-
-		stub_cleanup(netreq);
-		close(netreq->fd);
-		_getdns_check_dns_req_complete(dnsreq);
-	}
-}
-
-static void
-stub_tcp_write_cb(void *userarg)
-{
-	getdns_network_req *netreq = (getdns_network_req *)userarg;
-	getdns_dns_req *dnsreq = netreq->owner;
-	int q;
-
-	switch ((q = stub_tcp_write(netreq->fd, &netreq->tcp, netreq))) {
-	case STUB_TCP_AGAIN:
-		return;
-
-	case STUB_TCP_ERROR:
-		stub_erred(netreq);
-		return;
-
-	default:
-		netreq->query_id = (uint16_t) q;
-		GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
-		GETDNS_SCHEDULE_EVENT(
-		    dnsreq->loop, netreq->fd, dnsreq->context->timeout,
-		    getdns_eventloop_event_init(&netreq->event, netreq,
-		    stub_tcp_read_cb, NULL, stub_timeout_cb));
-		return;
-	}
-}
-
-/**************************/
 /* Upstream callback functions*/
 /**************************/
 
@@ -1357,7 +1399,6 @@ upstream_read_cb(void *userarg)
 	DEBUG_STUB("--- READ: %s\n", __FUNCTION__);
 	getdns_upstream *upstream = (getdns_upstream *)userarg;
 	getdns_network_req *netreq;
-	getdns_dns_req *dnsreq;
 	int q;
 	uint16_t query_id;
 	intptr_t query_id_intptr;
@@ -1367,7 +1408,7 @@ upstream_read_cb(void *userarg)
 		              &upstream->upstreams->mf);
 	else
 		q = stub_tcp_read(upstream->fd, &upstream->tcp,
-		             &upstream->upstreams->mf);
+		             &upstream->upstreams->mf, &upstream->event);
 
 	switch (q) {
 	case STUB_TCP_AGAIN:
@@ -1400,27 +1441,20 @@ upstream_read_cb(void *userarg)
 		/* TODO[TLS]: I don't think we should do this for TCP. We should stay
 		 * on a working connection until we hit a problem.*/
 		upstream->upstreams->current = 0;
+		
+		/* !THIS CODE NEEDS TESTING!*/
+		if (netreq->owner->edns_cookies &&
+		    match_and_process_server_cookie(
+		    netreq->upstream, netreq->tcp.read_buf,
+		    netreq->tcp.read_pos - netreq->tcp.read_buf))
+			return; /* Client cookie didn't match? */
 
-		if (netreq->owner == upstream->starttls_req) {
-			dnsreq = netreq->owner;
-			if (is_starttls_response(netreq)) {
-				upstream->tls_obj = tls_create_object(dnsreq,
-				                                      upstream->fd,
-				                                      upstream);
-				if (upstream->tls_obj == NULL) 
-					upstream->tls_hs_state = GETDNS_HS_FAILED;
-				upstream->tls_hs_state = GETDNS_HS_WRITE;
-			} else 
-				upstream->tls_hs_state = GETDNS_HS_FAILED;
+		if ((netreq->owner->context->idle_timeout != 0) &&
+		     process_keepalive(netreq->upstream, netreq, netreq->response,
+		                       netreq->response_len))
+				return;
 
-			/* Now reschedule the writes on this connection */
-			GETDNS_CLEAR_EVENT(upstream->loop, &upstream->event);
-			GETDNS_SCHEDULE_EVENT(upstream->loop, upstream->fd,
-			    netreq->owner->context->timeout,
-			    getdns_eventloop_event_init(&upstream->event, upstream,
-			     NULL, upstream_write_cb, NULL));
-		}
-
+		netreq->debug_end_time = _getdns_get_time_as_uintt64();
 		/* This also reschedules events for the upstream*/
 		stub_cleanup(netreq);
 
@@ -1428,8 +1462,7 @@ upstream_read_cb(void *userarg)
 		if (netreq->event.read_cb)
 			upstream_reschedule_netreq_events(upstream, netreq);
 
-		if (netreq->owner != upstream->starttls_req)
-			_getdns_check_dns_req_complete(netreq->owner);
+		_getdns_check_dns_req_complete(netreq->owner);
 	}
 }
 
@@ -1445,9 +1478,18 @@ upstream_write_cb(void *userarg)
 {
 	getdns_upstream *upstream = (getdns_upstream *)userarg;
 	getdns_network_req *netreq = upstream->write_queue;
-	getdns_dns_req *dnsreq = netreq->owner;
+	getdns_dns_req *dnsreq;
 	int q;
-
+	
+	if (!netreq) {
+		GETDNS_CLEAR_EVENT(upstream->loop, &upstream->event);
+		upstream->event.write_cb = NULL;
+		return;
+	}
+	dnsreq = netreq->owner;
+	/* TODO: think about TCP AGAIN */
+	netreq->debug_start_time = _getdns_get_time_as_uintt64();
+	
 	DEBUG_STUB("--- WRITE: %s: %p TYPE: %d\n", __FUNCTION__, netreq,
 	           netreq->request_type);
 	if (tls_requested(netreq) && tls_should_write(upstream))
@@ -1477,6 +1519,8 @@ upstream_write_cb(void *userarg)
 		return;
 
 	default:
+		/* Need this because auth status is reset on connection clode */
+		netreq->debug_tls_auth_status = netreq->upstream->tls_auth_failed;
 		upstream->writes_done++;
 		netreq->query_id = (uint16_t) q;
 		/* Unqueue the netreq from the write_queue */
@@ -1498,20 +1542,6 @@ upstream_write_cb(void *userarg)
 			GETDNS_SCHEDULE_EVENT(upstream->loop,
 			    upstream->fd, TIMEOUT_FOREVER, &upstream->event);
 		}
-		if (upstream->starttls_req && netreq->owner == upstream->starttls_req) {
-			/* Now deschedule any further writes on this connection until we get
-			 * the STARTTLS answer*/
-			GETDNS_CLEAR_EVENT(upstream->loop, &upstream->event);
-			upstream->event.write_cb = NULL;
-			GETDNS_SCHEDULE_EVENT(upstream->loop,
-			    upstream->fd, TIMEOUT_FOREVER, &upstream->event);
-		} else if (upstream->starttls_req) {
-			/* Delay the cleanup of the STARTTLS req until the write of the next
-			 * req in the queue since for sync req, the event on a request is
-			 * used for the callback that writes the next req. */
-			_getdns_dns_req_free(upstream->starttls_req);
-			upstream->starttls_req = NULL;
-		}
 		/* With synchonous lookups, schedule the read locally too */
 		if (netreq->event.write_cb) {
 			GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
@@ -1519,7 +1549,7 @@ upstream_write_cb(void *userarg)
 			    dnsreq->loop, upstream->fd, dnsreq->context->timeout,
 			    getdns_eventloop_event_init(&netreq->event, netreq,
 			    netreq_upstream_read_cb,
-			    (upstream->write_queue && !upstream->starttls_req ?
+			    (upstream->write_queue ?
 			      netreq_upstream_write_cb : NULL),
 			    stub_timeout_cb));
 		}
@@ -1555,12 +1585,6 @@ upstream_transport_valid(getdns_upstream *upstream,
 	    upstream->tcp.write_error != 0) {
 		return 0;
 	}
-	/* Allow TCP messages to be sent on a STARTTLS upstream that hasn't
-	 * upgraded to avoid opening a new connection if one is aleady open. */
-	if (transport == GETDNS_TRANSPORT_TCP &&
-	    upstream->transport == GETDNS_TRANSPORT_STARTTLS &&
-	    upstream->tls_hs_state == GETDNS_HS_FAILED)
-		return 1;
 	/* Otherwise, transport must match, and not have failed */
 	if (upstream->transport != transport)
 		return 0;
@@ -1656,28 +1680,6 @@ upstream_connect(getdns_upstream *upstream, getdns_transport_list_t transport,
 		upstream->loop = dnsreq->context->extension;
 		upstream->fd = fd;
 		break;
-	case GETDNS_TRANSPORT_STARTTLS:
-		/* Use existing if available. Let the fallback code handle it if
-		 * STARTTLS isn't availble. */
-		if (upstream->fd != -1)
-			return upstream->fd;
-		fd = tcp_connect(upstream, transport);
-		if (fd == -1) return -1;
-		if (!create_starttls_request(dnsreq, upstream, dnsreq->loop))
-			return GETDNS_RETURN_GENERIC_ERROR;
-		getdns_network_req *starttls_netreq = upstream->starttls_req->netreqs[0];
-		upstream->loop = dnsreq->context->extension;
-		upstream->fd = fd;
-		upstream_schedule_netreq(upstream, starttls_netreq);
-		/* Schedule at least the timeout locally, but use less than half the 
-		 * context value so by default this timeouts before the TIMEOUT_TLS.
-		 * And also the write if we perform a synchronous lookup */
-		GETDNS_SCHEDULE_EVENT(
-		    dnsreq->loop, upstream->fd, dnsreq->context->timeout / 3,
-		    getdns_eventloop_event_init(&starttls_netreq->event,
-		    starttls_netreq, NULL, (dnsreq->loop != upstream->loop
-		    ? netreq_upstream_write_cb : NULL), stub_timeout_cb));
-		break;
 	default:
 		return -1;
 		/* Nothing to do*/
@@ -1714,6 +1716,7 @@ find_upstream_for_netreq(getdns_network_req *netreq)
 			continue;
 		netreq->transport_current = i;
 		netreq->upstream = upstream;
+		netreq->keepalive_sent = 0;
 		return fd;
 	}
 	return -1;
@@ -1825,9 +1828,7 @@ upstream_schedule_netreq(getdns_upstream *upstream, getdns_network_req *netreq)
 		GETDNS_CLEAR_EVENT(upstream->loop, &upstream->event);
 		upstream->event.timeout_cb = NULL;
 		upstream->event.write_cb = upstream_write_cb;
-		if (upstream->tls_hs_state == GETDNS_HS_WRITE ||
-		    (upstream->starttls_req &&
-		     upstream->starttls_req->netreqs[0] == netreq)) {
+		if (upstream->tls_hs_state == GETDNS_HS_WRITE) {
 			/* Set a timeout on the upstream so we can catch failed setup*/
 			/* TODO[TLS]: When generic fallback supported, we should decide how
 			 * to split the timeout between transports. */
@@ -1867,11 +1868,9 @@ _getdns_submit_stub_request(getdns_network_req *netreq)
 		GETDNS_SCHEDULE_EVENT(
 		    dnsreq->loop, netreq->fd, dnsreq->context->timeout,
 		    getdns_eventloop_event_init(&netreq->event, netreq,
-		    NULL, (transport == GETDNS_TRANSPORT_UDP ?
-		    stub_udp_write_cb: stub_tcp_write_cb), stub_timeout_cb));
+		    NULL, stub_udp_write_cb, stub_timeout_cb));
 		return GETDNS_RETURN_GOOD;
-	
-	case GETDNS_TRANSPORT_STARTTLS:
+
 	case GETDNS_TRANSPORT_TLS:
 	case GETDNS_TRANSPORT_TCP:
 		upstream_schedule_netreq(netreq->upstream, netreq);
@@ -1879,10 +1878,69 @@ _getdns_submit_stub_request(getdns_network_req *netreq)
 		/* For TLS, set a short timeout to catch setup problems. This is reset
 		   when the connection is successful.*/
 		GETDNS_CLEAR_EVENT(dnsreq->loop, &netreq->event);
+		/*************************************************************
+		 ******                                                  *****
+		 ******              Confusing code alert!               *****
+		 ******                                                  *****
+		 *************************************************************
+		 *
+		 * Synchronous requests have their own event loop for the
+		 * occasion of that single request.  That event loop is in
+		 * the dnsreq structure: dnsreq->loop;
+		 *
+		 * We do not use the context's loop for the duration of the
+		 * synchronous query, because:
+		 * - Callbacks for outstanding (and thus asynchronous) queries
+		 *   might fire as a side effect.
+		 * - But worse, since the context's loop is created and managed
+		 *   by the user, which may well have her own non-dns related
+		 *   events scheduled against it, they will fire as well as a
+		 *   side effect of doing the synchronous request!
+		 *
+		 * Transports that keep connections open, have their own event
+		 * structure to keep their connection state.  The event is 
+		 * associated with the upstream struct.  Note that there is a
+		 * separate upstream struct for each statefull transport, so
+		 * each upstream has multiple transport structs!
+		 *
+		 *     side note: The upstream structs have their own reference
+		 *                to the "context's" event loop so they can,
+		 *                in theory, be detached (to finish running 
+		 *                queries for example).
+		 *
+		 * If a synchronous request is scheduled for such a transport,
+		 * then the sync-loop temporarily has to "run" that 
+		 * upstream/transport's event!  Outstanding requests for that
+		 * upstream/transport might the fire then as well as a side
+		 * effect.
+		 *
+		 *
+		 * Discussion
+		 * ==========
+		 * Furthermore, when a RECURSING sync request is made (opposed
+		 * to a STUB sync request) then outstanding RECURSING requests
+		 * may fire as a side effect, as we reuse the same code path 
+		 * as with async RECURSING requests.  In both cases 
+		 * ub_resolve_async() is used under the hood instead of
+		 * ub_resolve().  The fix (by calling ub_resolver()) we have
+		 * to create more divergent code paths.
+		 *
+		 * If we would simply accept the fact that side effects can
+		 * happen while doing sync requests, we could greatly simplify
+		 * this code and have the same code path (for scheduling the
+		 * request and the timeout) for both synchronous and
+		 * asynchronous requests.
+		 *
+		 * We should ask ourself: How likely is it that an user that
+		 * uses asynchronous queries would do a synchronous query, that
+		 * should block all async activity, in between?  Is
+		 * anticipating this behaviour (in which we only partly succeed
+		 * to begin with) worth the complexity of divergent code paths?
+		 */
 		GETDNS_SCHEDULE_EVENT(
 		    dnsreq->loop, netreq->upstream->fd, /*dnsreq->context->timeout,*/
 		    (transport == GETDNS_TRANSPORT_TLS ?
-		    dnsreq->context->timeout / 2 : dnsreq->context->timeout),
+		    dnsreq->context->timeout /2 : dnsreq->context->timeout),
 		    getdns_eventloop_event_init(&netreq->event, netreq, NULL,
 		    ( dnsreq->loop != netreq->upstream->loop /* Synchronous lookup? */
 		    ? netreq_upstream_write_cb : NULL), 

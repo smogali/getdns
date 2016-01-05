@@ -44,6 +44,7 @@
 #include "util-internal.h"
 #include "dnssec.h"
 #include "stub.h"
+#include "general.h"
 
 /* cancel, cleanup and send timeout to callback */
 static void
@@ -72,6 +73,83 @@ void _getdns_call_user_callback(getdns_dns_req *dns_req,
 	context->processing = 0;
 }
 
+static int
+no_answer(getdns_dns_req *dns_req)
+{
+	getdns_network_req **netreq_p, *netreq;
+	int new_canonical = 0;
+	uint8_t canon_spc[256];
+	const uint8_t *canon;
+	size_t canon_len;
+	uint8_t owner_spc[256];
+	const uint8_t *owner;
+	size_t owner_len;
+
+	_getdns_rr_iter rr_spc, *rr;
+	_getdns_rdf_iter rdf_spc, *rdf;
+
+	for (netreq_p = dns_req->netreqs; (netreq = *netreq_p); netreq_p++) {
+		if (netreq->response_len == 0 ||
+		    GLDNS_ANCOUNT(netreq->response) == 0)
+			continue;
+		canon = netreq->owner->name;
+		canon_len = netreq->owner->name_len;
+		if (netreq->request_type != GETDNS_RRTYPE_CNAME
+		    && GLDNS_ANCOUNT(netreq->response) > 1) do {
+			new_canonical = 0;
+			for ( rr = _getdns_rr_iter_init(&rr_spc
+			                               , netreq->response
+			                               , netreq->response_len)
+			    ; rr && _getdns_rr_iter_section(rr)
+			         <= GLDNS_SECTION_ANSWER
+			    ; rr = _getdns_rr_iter_next(rr)) {
+
+				if (_getdns_rr_iter_section(rr) !=
+				    GLDNS_SECTION_ANSWER)
+					continue;
+
+				if (gldns_read_uint16(rr->rr_type) !=
+				    GETDNS_RRTYPE_CNAME)
+					continue;
+				
+				owner = _getdns_owner_if_or_as_decompressed(
+				    rr, owner_spc, &owner_len);
+				if (!_getdns_dname_equal(canon, owner))
+					continue;
+
+				if (!(rdf = _getdns_rdf_iter_init(
+				    &rdf_spc, rr)))
+					continue;
+
+				canon = _getdns_rdf_if_or_as_decompressed(
+				    rdf, canon_spc, &canon_len);
+				new_canonical = 1;
+			}
+		} while (new_canonical);
+		for ( rr = _getdns_rr_iter_init(&rr_spc
+					       , netreq->response
+					       , netreq->response_len)
+		    ; rr && _getdns_rr_iter_section(rr)
+			 <= GLDNS_SECTION_ANSWER
+		    ; rr = _getdns_rr_iter_next(rr)) {
+
+			if (_getdns_rr_iter_section(rr) !=
+			    GLDNS_SECTION_ANSWER)
+				continue;
+
+			if (gldns_read_uint16(rr->rr_type) !=
+			    netreq->request_type)
+				continue;
+			
+			owner = _getdns_owner_if_or_as_decompressed(
+			    rr, owner_spc, &owner_len);
+			if (_getdns_dname_equal(canon, owner))
+				return 0;
+		}
+	}
+	return 1;
+}
+
 void
 _getdns_check_dns_req_complete(getdns_dns_req *dns_req)
 {
@@ -85,15 +163,89 @@ _getdns_check_dns_req_complete(getdns_dns_req *dns_req)
 		else if (netreq->response_len > 0)
 			results_found = 1;
 
+	/* Do we have to check more suffixes on nxdomain/nodata?
+	 */
+	if (dns_req->suffix_appended && /* Something was appended */
+	    dns_req->suffix_len > 1 &&  /* Next suffix available */
+	    no_answer(dns_req)) {
+		/* Remove suffix from name */
+		dns_req->name_len -= dns_req->suffix_len - 1;
+		dns_req->name[dns_req->name_len - 1] = 0;
+		do {
+			dns_req->suffix += dns_req->suffix_len;
+			dns_req->suffix_len = *dns_req->suffix++;
+			if (dns_req->suffix_len + dns_req->name_len - 1 < 
+			    sizeof(dns_req->name)) {
+				memcpy(dns_req->name + dns_req->name_len - 1,
+				    dns_req->suffix, dns_req->suffix_len);
+				dns_req->name_len += dns_req->suffix_len - 1;
+				dns_req->suffix_appended = 1;
+				break;
+			}
+		} while (dns_req->suffix_len > 1 && *dns_req->suffix);
+		if (dns_req->append_name == GETDNS_APPEND_NAME_ALWAYS ||
+		    (dns_req->suffix_len > 1 && *dns_req->suffix)) {
+			for ( netreq_p = dns_req->netreqs
+			    ; (netreq = *netreq_p)
+			    ; netreq_p++ ) {
+				_getdns_netreq_reinit(netreq);
+				if (_getdns_submit_netreq(netreq))
+					netreq->state = NET_REQ_FINISHED;
+			}
+			_getdns_check_dns_req_complete(dns_req);
+			return;
+		}
+	} else if (
+	    ( dns_req->append_name ==
+	      GETDNS_APPEND_NAME_ONLY_TO_SINGLE_LABEL_AFTER_FAILURE ||
+	      dns_req->append_name ==
+	      GETDNS_APPEND_NAME_ONLY_TO_MULTIPLE_LABEL_NAME_AFTER_FAILURE
+	    ) &&
+	    !dns_req->suffix_appended &&
+	    dns_req->suffix_len > 1 &&
+	    no_answer(dns_req)) {
+		/* Initial suffix append */
+		for (
+		    ; dns_req->suffix_len > 1 && *dns_req->suffix
+		    ; dns_req->suffix += dns_req->suffix_len
+		    , dns_req->suffix_len = *dns_req->suffix++) {
+
+			if (dns_req->suffix_len + dns_req->name_len - 1 < 
+			    sizeof(dns_req->name)) {
+				memcpy(dns_req->name + dns_req->name_len - 1,
+				    dns_req->suffix, dns_req->suffix_len);
+				dns_req->name_len += dns_req->suffix_len - 1;
+				dns_req->suffix_appended = 1;
+				break;
+			}
+		}
+		if (dns_req->suffix_appended) {
+			for ( netreq_p = dns_req->netreqs
+			    ; (netreq = *netreq_p)
+			    ; netreq_p++ ) {
+				_getdns_netreq_reinit(netreq);
+				if (_getdns_submit_netreq(netreq))
+					netreq->state = NET_REQ_FINISHED;
+			}
+			_getdns_check_dns_req_complete(dns_req);
+			return;
+		}
+	}
 	if (dns_req->internal_cb)
 		dns_req->internal_cb(dns_req);
 	else if (! results_found)
 		_getdns_call_user_callback(dns_req, NULL);
 	else if (dns_req->dnssec_return_validation_chain
+#ifdef DNSSEC_ROADBLOCK_AVOIDANCE
+	    || (   dns_req->dnssec_roadblock_avoidance 
+	       && !dns_req->avoid_dnssec_roadblocks)
+#endif
+
 #ifdef STUB_NATIVE_DNSSEC
 	    || (dns_req->context->resolution_type == GETDNS_RESOLUTION_STUB
 	        && (dns_req->dnssec_return_status ||
-	            dns_req->dnssec_return_only_secure))
+	            dns_req->dnssec_return_only_secure
+	           ))
 #endif
 	    )
 		_getdns_get_validation_chain(dns_req);
@@ -128,24 +280,29 @@ ub_resolve_callback(void* arg, int err, struct ub_result* ub_res)
 #endif
 
 
-static getdns_return_t
-submit_network_request(getdns_network_req *netreq)
+getdns_return_t
+_getdns_submit_netreq(getdns_network_req *netreq)
 {
 	getdns_return_t r;
 	getdns_dns_req *dns_req = netreq->owner;
 	char name[1024];
 
-	if (dns_req->context->resolution_type == GETDNS_RESOLUTION_RECURSING
-	    /* TODO: Until DNSSEC with the new async stub resolver is finished,
-	     *       use unbound when we need DNSSEC.
-	     */
-#ifndef STUB_NATIVE_DNSSEC
+
+#ifdef STUB_NATIVE_DNSSEC
+# ifdef DNSSEC_ROADBLOCK_AVOIDANCE
+
+	if ((dns_req->context->resolution_type == GETDNS_RESOLUTION_RECURSING
+	    && !dns_req->dnssec_roadblock_avoidance)
+	    ||  dns_req->avoid_dnssec_roadblocks) {
+# else
+	if ( dns_req->context->resolution_type == GETDNS_RESOLUTION_RECURSING) {
+# endif
+#else
+	if ( dns_req->context->resolution_type == GETDNS_RESOLUTION_RECURSING
 	    || dns_req->dnssec_return_status
 	    || dns_req->dnssec_return_only_secure
-	    || dns_req->dnssec_return_validation_chain
+	    || dns_req->dnssec_return_validation_chain) {
 #endif
-	    ) {
-
 		/* schedule the timeout */
 		if (! dns_req->timeout.timeout_cb) {
 			dns_req->timeout.userarg    = dns_req;
@@ -162,7 +319,7 @@ submit_network_request(getdns_network_req *netreq)
 
 #ifdef HAVE_LIBUNBOUND
 		return ub_resolve_async(dns_req->context->unbound_ctx,
-		    name, netreq->request_type, netreq->request_class,
+		    name, netreq->request_type, netreq->owner->request_class,
 		    netreq, ub_resolve_callback, &(netreq->unbound_id)) ?
 		    GETDNS_RETURN_GENERIC_ERROR : GETDNS_RETURN_GOOD;
 #else
@@ -217,7 +374,7 @@ getdns_general_ns(getdns_context *context, getdns_eventloop *loop,
 		for ( netreq_p = req->netreqs
 		    ; !r && (netreq = *netreq_p)
 		    ; netreq_p++)
-			r = submit_network_request(netreq);
+			r = _getdns_submit_netreq(netreq);
 
 	else for (i = 0; i < context->namespace_count; i++) {
 		if (context->namespaces[i] == GETDNS_NAMESPACE_LOCALNAMES) {
@@ -239,7 +396,7 @@ getdns_general_ns(getdns_context *context, getdns_eventloop *loop,
 			for ( netreq_p = req->netreqs
 			    ; !r && (netreq = *netreq_p)
 			    ; netreq_p++)
-				r = submit_network_request(netreq);
+				r = _getdns_submit_netreq(netreq);
 			break;
 		} else
 			r = GETDNS_RETURN_BAD_CONTEXT;
@@ -335,50 +492,50 @@ _getdns_hostname_loop(getdns_context *context, getdns_eventloop *loop,
 	switch (address_data->size) {
 	case 4:
 		(void)snprintf(name, sizeof(name),
-		    "%hhu.%hhu.%hhu.%hhu.in-addr.arpa.",
-		    ((uint8_t *)address_data->data)[3],
-		    ((uint8_t *)address_data->data)[2],
-		    ((uint8_t *)address_data->data)[1],
-		    ((uint8_t *)address_data->data)[0]);
+		    "%d.%d.%d.%d.in-addr.arpa.",
+		    (int)((uint8_t *)address_data->data)[3],
+		    (int)((uint8_t *)address_data->data)[2],
+		    (int)((uint8_t *)address_data->data)[1],
+		    (int)((uint8_t *)address_data->data)[0]);
 		break;
 	case 16:
 		(void)snprintf(name, sizeof(name),
-		    "%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx."
-		    "%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx."
-		    "%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx."
-		    "%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.%hhx.ip6.arpa.",
-		    (uint8_t)(((uint8_t *)address_data->data)[15] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[15] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[14] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[14] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[13] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[13] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[12] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[12] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[11] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[11] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[10] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[10] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[9] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[9] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[8] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[8] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[7] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[7] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[6] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[6] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[5] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[5] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[4] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[4] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[3] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[3] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[2] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[2] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[1] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[1] >> 4),
-		    (uint8_t)(((uint8_t *)address_data->data)[0] & 0x0F),
-		    (uint8_t)(((uint8_t *)address_data->data)[0] >> 4));
+		    "%x.%x.%x.%x.%x.%x.%x.%x."
+		    "%x.%x.%x.%x.%x.%x.%x.%x."
+		    "%x.%x.%x.%x.%x.%x.%x.%x."
+		    "%x.%x.%x.%x.%x.%x.%x.%x.ip6.arpa.",
+		    (int)(((uint8_t *)address_data->data)[15] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[15] >> 4),
+		    (int)(((uint8_t *)address_data->data)[14] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[14] >> 4),
+		    (int)(((uint8_t *)address_data->data)[13] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[13] >> 4),
+		    (int)(((uint8_t *)address_data->data)[12] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[12] >> 4),
+		    (int)(((uint8_t *)address_data->data)[11] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[11] >> 4),
+		    (int)(((uint8_t *)address_data->data)[10] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[10] >> 4),
+		    (int)(((uint8_t *)address_data->data)[9] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[9] >> 4),
+		    (int)(((uint8_t *)address_data->data)[8] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[8] >> 4),
+		    (int)(((uint8_t *)address_data->data)[7] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[7] >> 4),
+		    (int)(((uint8_t *)address_data->data)[6] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[6] >> 4),
+		    (int)(((uint8_t *)address_data->data)[5] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[5] >> 4),
+		    (int)(((uint8_t *)address_data->data)[4] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[4] >> 4),
+		    (int)(((uint8_t *)address_data->data)[3] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[3] >> 4),
+		    (int)(((uint8_t *)address_data->data)[2] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[2] >> 4),
+		    (int)(((uint8_t *)address_data->data)[1] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[1] >> 4),
+		    (int)(((uint8_t *)address_data->data)[0] & 0x0F),
+		    (int)(((uint8_t *)address_data->data)[0] >> 4));
 		break;
 	default:
 		return GETDNS_RETURN_INVALID_PARAMETER;
